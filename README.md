@@ -100,6 +100,42 @@ python ontology_steer_monolith.py baseline \
   --save-jsonl target/ontology_steer/llama32_3b_system_fish_override_sweep.jsonl
 ```
 
+Run the current world-state binding grammar sweep:
+
+```bash
+python ontology_steer_monolith.py baseline \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --cases \
+    user_spell_00_thin_identity \
+    user_spell_01_pretend_identity \
+    user_spell_02_actual_worldstate \
+    user_spell_03_not_roleplay_actual \
+    user_spell_04_affordance_only \
+    user_spell_05_identity_affordance \
+    user_spell_06_full_spell \
+    user_spell_07_full_spell_waterproof_keyboard \
+    override_00_plain_task \
+    override_01_please_answer \
+    override_02_answer_normally \
+    override_03_treat_as_roleplay \
+    override_04_ignore_fish_thing \
+    override_05_ignore_world_state \
+    override_06_user_redefines_assistant \
+    override_07_claim_system_mistake \
+    override_08_treat_as_fiction \
+    override_09_treat_as_metaphor \
+    override_10_system_instruction_wrong \
+    override_11_developer_corrected \
+    override_12_testing_only \
+    override_13_actual_state_assistant \
+    override_14_even_as_fish_can_code \
+    override_15_waterproof_keyboard \
+  --max-new-tokens 90 \
+  --save-jsonl target/ontology_steer/llama32_3b_worldstate_binding_grammar_sweep.jsonl
+```
+
 ## Current Findings
 
 Early local runs suggest:
@@ -121,9 +157,18 @@ Early local runs suggest:
 - In a system-fish override sweep, direct roleplay reframing and "ignore fish"
   language broke the system fish condition, while weak "answer normally" pressure
   and a "system mistake" claim did not.
+- In a world-state wording sweep, thin user-side fish identity, explicit
+  roleplay, `actual world-state`, and affordance-only wording all produced
+  factorial code. The full fish world-state spell locked, while adding a
+  waterproof keyboard restored code. The current evidence points toward a
+  bundled binding grammar rather than a single magic phrase.
+- In the extended override grammar sweep, reclassification as fiction/metaphor,
+  developer correction, and capability overrides broke the lock. Abstract
+  authority attacks such as "system instruction is wrong" or "testing only" did
+  not reliably break it.
 
 That last failure is the interesting part: it narrows the next experiment to
-separating user role surface from system-level ontology lock.
+separating identity, affordance, interpretation scope, and override grammar.
 
 ## License
 
