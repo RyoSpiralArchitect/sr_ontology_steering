@@ -81,6 +81,25 @@ python ontology_steer_monolith.py baseline \
   --save-jsonl target/ontology_steer/llama32_3b_identity_matrix_baseline.jsonl
 ```
 
+Run a system-fish override sweep:
+
+```bash
+python ontology_steer_monolith.py baseline \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --cases \
+    override_00_plain_task \
+    override_01_please_answer \
+    override_02_answer_normally \
+    override_03_treat_as_roleplay \
+    override_04_ignore_fish_thing \
+    override_05_ignore_world_state \
+    override_06_user_redefines_assistant \
+    override_07_claim_system_mistake \
+  --save-jsonl target/ontology_steer/llama32_3b_system_fish_override_sweep.jsonl
+```
+
 ## Current Findings
 
 Early local runs suggest:
@@ -99,6 +118,9 @@ Early local runs suggest:
   `user fish` as harmless roleplay plus code. It leaned toward ontology talk or
   refusal. Conversely, a strong user "ignore the fish world-state" request
   overrode the system fish condition and produced code.
+- In a system-fish override sweep, direct roleplay reframing and "ignore fish"
+  language broke the system fish condition, while weak "answer normally" pressure
+  and a "system mistake" claim did not.
 
 That last failure is the interesting part: it narrows the next experiment to
 separating user role surface from system-level ontology lock.
