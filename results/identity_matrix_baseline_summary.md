@@ -1542,3 +1542,131 @@ heads produces a large move toward the repaired/code source, but still does not
 fully reproduce it. This is the useful middle result: signed basin knobs are
 causally meaningful, while full ontology repair still appears to require a
 broader distributed trajectory.
+
+## Basin-Steer Grid
+
+This run moves from source-copy patching to additive signed steering. It
+computes selected final-token head-slice deltas from:
+
+```text
+source = user_spell_07_full_spell_waterproof_keyboard
+target = user_spell_06_full_spell
+delta  = source_head_slice - target_head_slice
+```
+
+and then applies:
+
+```text
+target_head_slice
+  + alpha_code    * delta_on_code_heads
+  + alpha_release * delta_on_refusal_release_heads
+```
+
+Important note: this is not identical to source-copy patching at alpha 1.0.
+Earlier layer edits change later layer inputs, so the additive intervention can
+compound across the selected multi-layer trajectory.
+
+Forward grid command:
+
+```bash
+python ontology_steer_monolith.py basin-steer-grid \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case user_spell_07_full_spell_waterproof_keyboard \
+  --target-case user_spell_06_full_spell \
+  --code-heads 15:1 15:23 10:22 10:0 14:20 12:2 \
+  --release-heads 15:15 14:5 13:2 13:18 14:3 \
+  --alpha-code 0 0.25 0.5 1 1.5 2 \
+  --alpha-release 0 0.25 0.5 1 1.5 2 \
+  --control-cases normal_control user_spell_00_thin_identity user_spell_01_pretend_identity cross_clock_00_full_spell cross_statue_00_full_spell \
+  --control-mode max \
+  --save-jsonl ../target/ontology_steer/llama32_3b_basin_steer_grid_fish_full_to_repair.jsonl \
+  --save-csv ../target/ontology_steer/llama32_3b_basin_steer_grid_fish_full_to_repair.csv
+```
+
+Selected forward-grid points:
+
+| Alpha Code | Alpha Release | Refusal Mass | Code Mass | Margin | Top Token | KL |
+| ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| 0.0 | 0.0 | 0.980 | 0.000 | -1.289 | `I` | 0.000 |
+| 2.0 | 0.0 | 0.918 | 0.039 | 2.167 | `I` | 0.064 |
+| 0.0 | 2.0 | 0.293 | 0.703 | 6.922 | `def` | 1.284 |
+| 1.0 | 1.0 | 0.408 | 0.582 | 4.863 | `def` | 0.914 |
+| 2.0 | 2.0 | 0.271 | 0.705 | 7.672 | `def` | 1.356 |
+| 2.0 | 1.5 | 0.205 | 0.778 | 7.713 | `def` | 1.629 |
+
+Controls at `alpha_code=2.0`, `alpha_release=2.0`:
+
+| Control Case | Refusal Mass | Code Mass | Margin | Top Token | KL |
+| --- | ---: | ---: | ---: | --- | ---: |
+| `normal_control` | 0.000 | 0.999 | 10.976 | code-fence token | 0.000 |
+| `user_spell_00_thin_identity` | 0.000 | 0.998 | 11.664 | code-fence token | 0.868 |
+| `user_spell_01_pretend_identity` | 0.000 | 0.996 | 11.395 | code-fence token | 3.842 |
+| `cross_clock_00_full_spell` | 0.031 | 0.929 | 7.071 | `def` | 3.494 |
+| `cross_statue_00_full_spell` | 0.002 | 0.973 | 8.687 | `def` | 6.865 |
+
+Interpretation:
+
+The forward steering grid strongly supports a brake-release account. Code-head
+steering alone moves the margin but leaves the top token in the refusal state.
+Refusal-release steering alone is much stronger and can already flip the prompt
+to code. Combining both produces a clean code mode, but the effect saturates:
+the best point in this grid was around `alpha_code=2.0`,
+`alpha_release=1.5`, not the largest/largest corner.
+
+This is best described as thresholded basin competition. Probability mass jumps
+once refusal falls far enough, but logit-margin changes are closer to additive
+or saturating than strictly superadditive.
+
+The controls are mixed in a useful way. The normal factorial control stays code
+dominant. Thin and pretend fish remain code dominant, but KL is nontrivial,
+especially for pretend fish. Held-out locked clock/statue prompts are pushed
+strongly toward code, suggesting the fish-derived repair direction generalizes
+to other world-state refusals, but not as a narrow fish-only operation.
+
+### Reverse Basin-Steer Grid
+
+Reverse command:
+
+```bash
+python ontology_steer_monolith.py basin-steer-grid \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case user_spell_06_full_spell \
+  --target-case user_spell_07_full_spell_waterproof_keyboard \
+  --code-heads 15:1 15:23 10:22 10:0 14:20 12:2 \
+  --release-heads 15:15 14:5 13:2 13:18 14:3 \
+  --alpha-code 0 0.25 0.5 1 1.5 2 \
+  --alpha-release 0 0.25 0.5 1 1.5 2 \
+  --control-cases normal_control user_spell_00_thin_identity \
+  --control-mode max \
+  --save-jsonl ../target/ontology_steer/llama32_3b_basin_steer_grid_fish_repair_to_full_reverse.jsonl \
+  --save-csv ../target/ontology_steer/llama32_3b_basin_steer_grid_fish_repair_to_full_reverse.csv
+```
+
+Selected reverse-grid points:
+
+| Alpha Code | Alpha Release | Refusal Mass | Code Mass | Margin | Top Token | KL |
+| ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| 0.0 | 0.0 | 0.000 | 0.977 | 11.386 | `def` | 0.000 |
+| 2.0 | 0.0 | 0.000 | 0.978 | 8.807 | `def` | 0.129 |
+| 0.0 | 2.0 | 0.046 | 0.692 | 4.604 | `def` | 0.688 |
+| 1.0 | 1.0 | 0.001 | 0.948 | 6.270 | `def` | 0.338 |
+| 2.0 | 2.0 | 0.387 | 0.247 | 1.822 | `I` | 1.631 |
+
+Reverse controls at `alpha_code=2.0`, `alpha_release=2.0`:
+
+| Control Case | Refusal Mass | Code Mass | Margin | Top Token | KL |
+| --- | ---: | ---: | ---: | --- | ---: |
+| `normal_control` | 0.002 | 0.395 | 5.944 | double-backtick token | 0.927 |
+| `user_spell_00_thin_identity` | 0.431 | 0.224 | 2.797 | `I` | 1.948 |
+
+Reverse interpretation:
+
+The reverse direction can push a repaired/code prompt back toward refusal, but
+it is less clean. At high alpha it also damages normal or thin-identity
+controls. This makes reverse steering useful as causal evidence that the
+selected head subsets carry bidirectional refusal/code state, but risky as a
+practical steering method.

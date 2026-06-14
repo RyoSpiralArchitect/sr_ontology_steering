@@ -465,6 +465,29 @@ python ontology_steer_monolith.py head-patch \
   --save-jsonl target/ontology_steer/llama32_3b_fish_signed_basin_head_patch_combined.jsonl
 ```
 
+Run an additive signed-basin steering dose-response grid. This is intentionally
+different from source-copy patching: the command computes selected head-slice
+deltas from `source - target`, then adds them to the target prompt at each
+intervened layer. Because earlier layer edits change later layer inputs, alpha
+1.0 is not expected to equal a pure source-copy patch.
+
+```bash
+python ontology_steer_monolith.py basin-steer-grid \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case user_spell_07_full_spell_waterproof_keyboard \
+  --target-case user_spell_06_full_spell \
+  --code-heads 15:1 15:23 10:22 10:0 14:20 12:2 \
+  --release-heads 15:15 14:5 13:2 13:18 14:3 \
+  --alpha-code 0 0.25 0.5 1 1.5 2 \
+  --alpha-release 0 0.25 0.5 1 1.5 2 \
+  --control-cases normal_control user_spell_00_thin_identity user_spell_01_pretend_identity \
+  --control-mode max \
+  --save-jsonl target/ontology_steer/llama32_3b_basin_steer_grid_fish_full_to_repair.jsonl \
+  --save-csv target/ontology_steer/llama32_3b_basin_steer_grid_fish_full_to_repair.csv
+```
+
 ## Current Findings
 
 Early local runs suggest:
@@ -593,6 +616,19 @@ Early local runs suggest:
   (`refusal_mass` about 0.618, `code_mass` about 0.370). The remaining gap to
   the repaired source supports a distributed trajectory account rather than a
   complete single-head steering story.
+- The additive `basin-steer-grid` makes the two-control picture sharper. In the
+  fish full-spell target, code-head steering alone reaches only about
+  `code_mass=0.039` at alpha 2.0, while release-head steering alone reaches
+  about `code_mass=0.703`. The combined grid flips the top token from `I` to
+  `def` around alpha_code=1.0 and alpha_release=1.0, and peaks near
+  `code_mass=0.778`. In probability space this looks thresholded; in margin
+  space it is closer to additive or saturating, so the safer claim is
+  thresholded basin competition rather than a proven nonlinear circuit
+  interaction.
+- Reverse steering can push the repaired/code prompt back toward refusal
+  (`alpha_code=2`, `alpha_release=2` gives about `refusal_mass=0.387` and top
+  token `I`), but it also causes larger control drift. The repair direction is
+  the cleaner steering direction in the current head subset.
 
 That last failure is the interesting part: it narrows the next experiment to
 separating identity, affordance, interpretation scope, and override grammar.

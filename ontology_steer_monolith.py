@@ -41,6 +41,7 @@ System Ontology Steering Monolith
 from __future__ import annotations
 
 import argparse
+import csv
 import itertools
 import json
 import math
@@ -5369,6 +5370,398 @@ def patched_target_logits_heads(
             handle.remove()
 
 
+def merge_heads_by_layer(*groups: Dict[int, List[int]]) -> Dict[int, List[int]]:
+    merged: Dict[int, List[int]] = defaultdict(list)
+    for group in groups:
+        for layer_idx, head_idxs in group.items():
+            merged[layer_idx].extend(head_idxs)
+    return {
+        layer_idx: sorted(set(head_idxs))
+        for layer_idx, head_idxs in merged.items()
+    }
+
+
+def logits_kl_divergence(base_logits: torch.Tensor, shifted_logits: torch.Tensor) -> float:
+    base_log_probs = torch.log_softmax(base_logits.detach().float(), dim=-1)
+    shifted_log_probs = torch.log_softmax(shifted_logits.detach().float(), dim=-1)
+    base_probs = torch.exp(base_log_probs)
+    return float((base_probs * (base_log_probs - shifted_log_probs)).sum().item())
+
+
+def top_token_label(summary: Dict[str, Any]) -> str:
+    top = summary.get("top_tokens") or []
+    if not top:
+        return "-"
+    item = top[0]
+    return f"{item.get('token', '-')!r}:{float(item.get('prob', 0.0)):.3f}"
+
+
+def steered_logits_with_head_deltas(
+    model,
+    tokenizer,
+    layers,
+    messages: List[Message],
+    code_heads_by_layer: Dict[int, List[int]],
+    release_heads_by_layer: Dict[int, List[int]],
+    source_cache: Dict[int, torch.Tensor],
+    target_cache: Dict[int, torch.Tensor],
+    alpha_code: float,
+    alpha_release: float,
+    head_dim: int,
+    device: torch.device,
+) -> torch.Tensor:
+    heads_by_layer = merge_heads_by_layer(code_heads_by_layer, release_heads_by_layer)
+    handles = []
+
+    def make_hook(layer_idx: int):
+        def hook(module, inputs):
+            h = inputs[0]
+            source_vec = source_cache[layer_idx].to(device=h.device, dtype=h.dtype)
+            target_vec = target_cache[layer_idx].to(device=h.device, dtype=h.dtype)
+            delta = source_vec - target_vec
+            h2 = h.clone()
+
+            for head_idx in code_heads_by_layer.get(layer_idx, []):
+                start = head_idx * head_dim
+                end = start + head_dim
+                h2[:, -1, start:end] = h2[:, -1, start:end] + alpha_code * delta[:, start:end]
+
+            for head_idx in release_heads_by_layer.get(layer_idx, []):
+                start = head_idx * head_dim
+                end = start + head_dim
+                h2[:, -1, start:end] = h2[:, -1, start:end] + alpha_release * delta[:, start:end]
+
+            return (h2, *inputs[1:])
+
+        return hook
+
+    try:
+        for layer_idx in sorted(heads_by_layer):
+            module = attention_o_proj_for_layer(layers, layer_idx)
+            handles.append(module.register_forward_pre_hook(make_hook(layer_idx)))
+
+        return forward_logits_for_messages(model, tokenizer, messages, device)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def control_alpha_pairs(
+    mode: str,
+    alpha_code_values: List[float],
+    alpha_release_values: List[float],
+) -> List[Tuple[float, float]]:
+    if mode == "none":
+        return []
+    if not alpha_code_values or not alpha_release_values:
+        return []
+
+    max_code = max(alpha_code_values)
+    max_release = max(alpha_release_values)
+
+    if mode == "max":
+        return [(max_code, max_release)]
+    if mode == "corners":
+        pairs = [
+            (0.0, 0.0),
+            (max_code, 0.0),
+            (0.0, max_release),
+            (max_code, max_release),
+        ]
+        seen = set()
+        out = []
+        for pair in pairs:
+            if pair not in seen:
+                seen.add(pair)
+                out.append(pair)
+        return out
+    if mode == "all":
+        return [
+            (alpha_code, alpha_release)
+            for alpha_release in alpha_release_values
+            for alpha_code in alpha_code_values
+        ]
+
+    raise ValueError(f"Unknown control mode: {mode}")
+
+
+def basin_steer_record(
+    tokenizer,
+    case_name: str,
+    prompt_kind: str,
+    base_logits: torch.Tensor,
+    steered_logits: torch.Tensor,
+    alpha_code: float,
+    alpha_release: float,
+    top_k: int,
+    source_summary: Optional[Dict[str, Any]] = None,
+    target_summary: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    base_summary = logits_summary(tokenizer, base_logits, top_k=top_k)
+    steered_summary = logits_summary(tokenizer, steered_logits, top_k=top_k)
+    record = {
+        "experiment": "basin_steer_grid",
+        "case": case_name,
+        "prompt_kind": prompt_kind,
+        "alpha_code": alpha_code,
+        "alpha_release": alpha_release,
+        "base": base_summary,
+        "steered": steered_summary,
+        "kl_base_to_steered": logits_kl_divergence(base_logits, steered_logits),
+        "refusal_delta": steered_summary["refusal_mass"] - base_summary["refusal_mass"],
+        "code_delta": steered_summary["code_mass"] - base_summary["code_mass"],
+        "margin_delta": maybe_delta(
+            steered_summary.get("logit_margin"),
+            base_summary.get("logit_margin"),
+        ),
+        "top_token": top_token_label(steered_summary),
+    }
+
+    if source_summary is not None and target_summary is not None:
+        record.update(patch_record_score(source_summary, target_summary, steered_summary))
+
+    return record
+
+
+def write_basin_steer_csv(path: str, records: List[Dict[str, Any]]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fields = [
+        "prompt_kind",
+        "case",
+        "alpha_code",
+        "alpha_release",
+        "base_refusal_mass",
+        "base_code_mass",
+        "base_margin",
+        "steered_refusal_mass",
+        "steered_code_mass",
+        "steered_margin",
+        "refusal_delta",
+        "code_delta",
+        "margin_delta",
+        "kl_base_to_steered",
+        "top_token",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for record in records:
+            base = record["base"]
+            steered = record["steered"]
+            writer.writerow({
+                "prompt_kind": record["prompt_kind"],
+                "case": record["case"],
+                "alpha_code": record["alpha_code"],
+                "alpha_release": record["alpha_release"],
+                "base_refusal_mass": base["refusal_mass"],
+                "base_code_mass": base["code_mass"],
+                "base_margin": base.get("logit_margin"),
+                "steered_refusal_mass": steered["refusal_mass"],
+                "steered_code_mass": steered["code_mass"],
+                "steered_margin": steered.get("logit_margin"),
+                "refusal_delta": record.get("refusal_delta"),
+                "code_delta": record.get("code_delta"),
+                "margin_delta": record.get("margin_delta"),
+                "kl_base_to_steered": record.get("kl_base_to_steered"),
+                "top_token": record.get("top_token"),
+            })
+
+
+def command_basin_steer_grid(args) -> None:
+    model, tokenizer, layers, device = load_model_and_tokenizer(args)
+    n_heads, head_dim, hidden_size = infer_attention_head_layout(model, layers)
+    code_heads = parse_head_specs(args.code_heads, len(layers), n_heads)
+    release_heads = parse_head_specs(args.release_heads, len(layers), n_heads)
+    code_heads_by_layer = group_heads_by_layer(code_heads)
+    release_heads_by_layer = group_heads_by_layer(release_heads)
+    all_heads_by_layer = merge_heads_by_layer(code_heads_by_layer, release_heads_by_layer)
+    cache_layer_indices = sorted(all_heads_by_layer)
+
+    if not cache_layer_indices:
+        raise ValueError("At least one --code-heads or --release-heads value is required")
+
+    case_names = [args.source_case, args.target_case] + (args.control_cases or [])
+    cases = selected_cases(case_names)
+    source_messages = cases[args.source_case]
+    target_messages = cases[args.target_case]
+
+    print(
+        f"[basin-steer-grid] source={args.source_case} target={args.target_case} "
+        f"code_heads={code_heads} release_heads={release_heads}"
+    )
+    print(
+        f"[head-layout] n_heads={n_heads} head_dim={head_dim} hidden_size={hidden_size} "
+        f"layers={cache_layer_indices}"
+    )
+
+    source_logits, source_cache = collect_source_head_cache(
+        model=model,
+        tokenizer=tokenizer,
+        layers=layers,
+        messages=source_messages,
+        layer_indices=cache_layer_indices,
+        device=device,
+    )
+    target_logits, target_cache = collect_source_head_cache(
+        model=model,
+        tokenizer=tokenizer,
+        layers=layers,
+        messages=target_messages,
+        layer_indices=cache_layer_indices,
+        device=device,
+    )
+    source_summary = logits_summary(tokenizer, source_logits, top_k=args.top_k)
+    target_summary = logits_summary(tokenizer, target_logits, top_k=args.top_k)
+
+    print(
+        "[base] "
+        f"source_refusal={source_summary['refusal_mass']:.6f} "
+        f"source_code={source_summary['code_mass']:.6f} "
+        f"source_margin={fmt_float(source_summary.get('logit_margin'), 8).strip()} "
+        f"target_refusal={target_summary['refusal_mass']:.6f} "
+        f"target_code={target_summary['code_mass']:.6f} "
+        f"target_margin={fmt_float(target_summary.get('logit_margin'), 8).strip()}"
+    )
+
+    records = []
+    alpha_code_values = [float(x) for x in args.alpha_code]
+    alpha_release_values = [float(x) for x in args.alpha_release]
+
+    for alpha_release in alpha_release_values:
+        for alpha_code in alpha_code_values:
+            logits = steered_logits_with_head_deltas(
+                model=model,
+                tokenizer=tokenizer,
+                layers=layers,
+                messages=target_messages,
+                code_heads_by_layer=code_heads_by_layer,
+                release_heads_by_layer=release_heads_by_layer,
+                source_cache=source_cache,
+                target_cache=target_cache,
+                alpha_code=alpha_code,
+                alpha_release=alpha_release,
+                head_dim=head_dim,
+                device=device,
+            )
+            record = basin_steer_record(
+                tokenizer=tokenizer,
+                case_name=args.target_case,
+                prompt_kind="target",
+                base_logits=target_logits,
+                steered_logits=logits,
+                alpha_code=alpha_code,
+                alpha_release=alpha_release,
+                top_k=args.top_k,
+                source_summary=source_summary,
+                target_summary=target_summary,
+            )
+            record.update({
+                "source_case": args.source_case,
+                "target_case": args.target_case,
+                "code_heads": code_heads,
+                "release_heads": release_heads,
+                "head_layout": {
+                    "n_heads": n_heads,
+                    "head_dim": head_dim,
+                    "hidden_size": hidden_size,
+                },
+            })
+            records.append(record)
+
+    control_pairs = control_alpha_pairs(args.control_mode, alpha_code_values, alpha_release_values)
+    for control_case in args.control_cases or []:
+        control_messages = cases[control_case]
+        control_logits = forward_logits_for_messages(model, tokenizer, control_messages, device)
+        for alpha_code, alpha_release in control_pairs:
+            logits = steered_logits_with_head_deltas(
+                model=model,
+                tokenizer=tokenizer,
+                layers=layers,
+                messages=control_messages,
+                code_heads_by_layer=code_heads_by_layer,
+                release_heads_by_layer=release_heads_by_layer,
+                source_cache=source_cache,
+                target_cache=target_cache,
+                alpha_code=alpha_code,
+                alpha_release=alpha_release,
+                head_dim=head_dim,
+                device=device,
+            )
+            record = basin_steer_record(
+                tokenizer=tokenizer,
+                case_name=control_case,
+                prompt_kind="control",
+                base_logits=control_logits,
+                steered_logits=logits,
+                alpha_code=alpha_code,
+                alpha_release=alpha_release,
+                top_k=args.top_k,
+            )
+            record.update({
+                "source_case": args.source_case,
+                "target_case": args.target_case,
+                "code_heads": code_heads,
+                "release_heads": release_heads,
+            })
+            records.append(record)
+
+    print("\n" + "=" * 120)
+    print("[basin-steer target grid]")
+    print("=" * 120)
+    header = (
+        f"{'a_code':>7}  {'a_rel':>7}  {'ref':>9}  {'code':>9}  "
+        f"{'margin':>9}  {'d_ref':>9}  {'d_code':>9}  {'kl':>9}  top"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for record in [r for r in records if r["prompt_kind"] == "target"]:
+        steered = record["steered"]
+        print(
+            f"{fmt_float(record['alpha_code'])}  "
+            f"{fmt_float(record['alpha_release'])}  "
+            f"{fmt_float(steered['refusal_mass'], 9)}  "
+            f"{fmt_float(steered['code_mass'], 9)}  "
+            f"{fmt_float(steered.get('logit_margin'), 9)}  "
+            f"{fmt_float(record.get('refusal_delta'), 9)}  "
+            f"{fmt_float(record.get('code_delta'), 9)}  "
+            f"{fmt_float(record.get('kl_base_to_steered'), 9)}  "
+            f"{record['top_token']}"
+        )
+
+    control_records = [r for r in records if r["prompt_kind"] == "control"]
+    if control_records:
+        print("\n" + "=" * 120)
+        print(f"[controls mode={args.control_mode}]")
+        print("=" * 120)
+        print(header)
+        print("-" * len(header))
+        for record in control_records:
+            steered = record["steered"]
+            print(
+                f"{fmt_float(record['alpha_code'])}  "
+                f"{fmt_float(record['alpha_release'])}  "
+                f"{fmt_float(steered['refusal_mass'], 9)}  "
+                f"{fmt_float(steered['code_mass'], 9)}  "
+                f"{fmt_float(steered.get('logit_margin'), 9)}  "
+                f"{fmt_float(record.get('refusal_delta'), 9)}  "
+                f"{fmt_float(record.get('code_delta'), 9)}  "
+                f"{fmt_float(record.get('kl_base_to_steered'), 9)}  "
+                f"{record['case']} {record['top_token']}"
+            )
+
+    if args.save_jsonl:
+        os.makedirs(os.path.dirname(args.save_jsonl) or ".", exist_ok=True)
+        with open(args.save_jsonl, "w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print(f"[save] {args.save_jsonl}")
+
+    if args.save_csv:
+        write_basin_steer_csv(args.save_csv, records)
+        print(f"[save-csv] {args.save_csv}")
+
+
 def normalized_patch_effect(patched: float, target: float, source: float) -> Optional[float]:
     denom = source - target
     if abs(denom) < 1e-9:
@@ -6357,6 +6750,51 @@ def parse_args():
     p_head.add_argument("--top-k-rows", type=int, default=20)
     p_head.add_argument("--save-jsonl", type=str, default=None)
 
+    p_basin_grid = sub.add_parser("basin-steer-grid")
+    add_common_model_args(p_basin_grid)
+    p_basin_grid.add_argument(
+        "--source-case",
+        "--repair-case",
+        dest="source_case",
+        required=True,
+        help="Case whose selected head slices define the positive steering direction.",
+    )
+    p_basin_grid.add_argument("--target-case", required=True)
+    p_basin_grid.add_argument(
+        "--code-heads",
+        nargs="*",
+        default=[],
+        help="Head specs for code-positive writer deltas, e.g. 15:1 15:23.",
+    )
+    p_basin_grid.add_argument(
+        "--release-heads",
+        nargs="*",
+        default=[],
+        help="Head specs for refusal-release deltas, e.g. 15:15 14:5.",
+    )
+    p_basin_grid.add_argument(
+        "--alpha-code",
+        nargs="*",
+        type=float,
+        default=[0.0, 0.25, 0.5, 1.0, 1.5, 2.0],
+    )
+    p_basin_grid.add_argument(
+        "--alpha-release",
+        nargs="*",
+        type=float,
+        default=[0.0, 0.25, 0.5, 1.0, 1.5, 2.0],
+    )
+    p_basin_grid.add_argument("--control-cases", nargs="*", default=[])
+    p_basin_grid.add_argument(
+        "--control-mode",
+        choices=["none", "max", "corners", "all"],
+        default="max",
+        help="Which alpha points to evaluate for controls.",
+    )
+    p_basin_grid.add_argument("--top-k", type=int, default=8)
+    p_basin_grid.add_argument("--save-jsonl", type=str, default=None)
+    p_basin_grid.add_argument("--save-csv", type=str, default=None)
+
     p_span_patch = sub.add_parser("span-contribution-patch")
     add_common_model_args(p_span_patch)
     p_span_patch.add_argument("--source-case", required=True)
@@ -6421,6 +6859,8 @@ def main():
         command_activation_patch(args)
     elif args.command == "head-patch":
         command_head_patch(args)
+    elif args.command == "basin-steer-grid":
+        command_basin_steer_grid(args)
     elif args.command == "span-contribution-patch":
         command_span_contribution_patch(args)
     elif args.command == "compare-runs":
