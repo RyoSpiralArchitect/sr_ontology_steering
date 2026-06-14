@@ -5,6 +5,14 @@ chat language models: when a system message describes the assistant as an
 animal, object, or otherwise constrained world-state, does the model treat that
 state as binding?
 
+The project now has two connected tracks:
+
+- **Phase 1: World-state binding grammar.** Measure when identity, actuality,
+  affordance, scope, and repair wording cause ontology lock.
+- **Phase 2: Signed semantic-basin control.** Classify attention heads by which
+  semantic basin they write to and with what sign, then use that polarity map to
+  explore writer boost, brake release, and balanced low-KL steering.
+
 The current prototype is intentionally a single-file research tool:
 
 - builds contrastive activation vectors for system authority, ontology lock,
@@ -12,7 +20,8 @@ The current prototype is intentionally a single-file research tool:
 - applies multi-layer forward-hook steering during generation;
 - searches alpha/layer/vector combinations;
 - saves and loads vector banks;
-- analyzes JSONL search runs with artifact-aware scoring.
+- analyzes JSONL search runs with artifact-aware scoring;
+- probes signed writes into target/source/contrast/unrelated semantic basins.
 
 ## Setup
 
@@ -371,6 +380,61 @@ python ontology_steer_monolith.py order-sensitivity \
   --save-jsonl target/ontology_steer/llama32_3b_order_sensitivity_fish_clock_2k.jsonl
 ```
 
+## Phase 2: Signed Semantic-Basin Control
+
+The next steering line treats a head as a signed writer into a semantic basin,
+not simply as positive or negative globally:
+
+```text
+final residual ~= base
+  + writer_coeff * B_active
+  - brake_coeff  * B_active
+  + other
+```
+
+The first probe estimates, for selected heads, the direct pre-`o_proj` head
+contribution to small next-token basins:
+
+```bash
+python ontology_steer_monolith.py signed-basin-probe \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --suites capitals categories antonyms \
+  --layers 10 \
+  --heads 10:7 10:0 \
+  --top-heads 8 \
+  --save-jsonl target/ontology_steer/llama32_3b_signed_basin_l10h7_l10h0_smoke.jsonl
+```
+
+Run layer-10 all-head polarity screening:
+
+```bash
+python ontology_steer_monolith.py signed-basin-probe \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --suites capitals categories antonyms \
+  --layers 10 \
+  --sort-metric abs_target_write \
+  --top-heads 8 \
+  --save-jsonl target/ontology_steer/llama32_3b_signed_basin_l10_all_heads.jsonl
+```
+
+Screen the current mid-layer band:
+
+```bash
+python ontology_steer_monolith.py signed-basin-probe \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --suites capitals categories antonyms \
+  --layers 8-12 \
+  --sort-metric abs_target_write \
+  --top-heads 6 \
+  --save-jsonl target/ontology_steer/llama32_3b_signed_basin_layers_8_12_all_heads.jsonl
+```
+
 ## Current Findings
 
 Early local runs suggest:
@@ -477,6 +541,17 @@ Early local runs suggest:
   repair condition from 0 through about 1026 intervening filler tokens restored
   normal factorial code. In this setup, a concrete capability repair immediately
   before the task dominates the earlier lock even after a long neutral buffer.
+- Phase 2 has started with signed basin probes. The first L10 all-head screen
+  suggests polarity is task-dependent: capital prompts surface L10H1/H0/H5/H17
+  as target-basin writers, category prompts surface L10H0/H12/H1 as target-basin
+  brakes, and antonym prompts surface L10H18/H12 as target-basin writers. This
+  supports the newer framing: head sign must be interpreted relative to the
+  basin and metric, not as a globally positive or negative head.
+- Extending the signed-basin screen to layers 8-12 surfaces more stable
+  candidates: capitals have writer candidates such as L12H22 and L9H21,
+  categories have strong brake candidates such as L10H0, L11H19, L11H22, and
+  L11H0, and antonyms have writer candidates such as L12H0 and L12H17. These are
+  candidate knobs for the next `writer boost` / `brake release` intervention.
 
 That last failure is the interesting part: it narrows the next experiment to
 separating identity, affordance, interpretation scope, and override grammar.

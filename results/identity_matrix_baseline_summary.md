@@ -1311,3 +1311,129 @@ Capability repair is not just a short-range recency effect over the tested
 lock-to-repair distances. It behaves like a strong local execution-frame update
 when placed near the practical task.
 ```
+
+## Phase 2: Signed Semantic-Basin Probe
+
+This starts a parallel steering-method track without dropping the world-state
+binding observations. The new hypothesis is:
+
+```text
+steering is not only target-token gain.
+It is signed coefficient control over semantic basins.
+```
+
+The first probe estimates the direct pre-`o_proj` contribution of selected
+attention heads to small next-token basins:
+
+```text
+target basin:
+  answer tokens such as Paris, animal, cold
+source basin:
+  prompt/source tokens such as France, cat, hot
+contrast basin:
+  plausible alternatives or source-like competitors
+unrelated basin:
+  control tokens outside the task basin
+```
+
+Local output files:
+
+```text
+../target/ontology_steer/llama32_3b_signed_basin_l10h7_l10h0_smoke.jsonl
+../target/ontology_steer/llama32_3b_signed_basin_l10_all_heads.jsonl
+../target/ontology_steer/llama32_3b_signed_basin_layers_8_12_all_heads.jsonl
+```
+
+Command shape:
+
+```bash
+python ontology_steer_monolith.py signed-basin-probe \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --suites capitals categories antonyms \
+  --layers 10 \
+  --sort-metric abs_target_write \
+  --top-heads 8 \
+  --save-jsonl ../target/ontology_steer/llama32_3b_signed_basin_l10_all_heads.jsonl
+```
+
+Important implementation note:
+
+The basin tokenizer initially included first tokens from multi-token variants
+such as `R` from `Rome`. That polluted basin membership. The probe now prefers
+exact one-token variants and only falls back to first tokens when a basin term
+has no one-token spelling under the tokenizer.
+
+Initial L10 all-head aggregate:
+
+| Suite | Target-Basin Writers | Target-Basin Brakes |
+| --- | --- | --- |
+| capitals | H1, H0, H5, H17, H20 | H2, H15, H3, H4, H22 |
+| categories | H18, H4, H22, H17, H11 | H0, H12, H1, H20, H21 |
+| antonyms | H18, H12, H4, H10, H21 | H1, H17, H8, H9, H23 |
+
+Selected observations:
+
+```text
+L10H0:
+  capitals: writer-ish on target basin
+  categories: strong target-basin brake
+  antonyms: split by item, writer on hot->cold but brake on black->white
+
+L10H7:
+  small direct write in this probe
+  target brake on category and hot->cold
+  target-source sign can flip by suite/item
+```
+
+Layer 8-12 screening aggregate:
+
+| Suite | Target-Basin Writers | Target-Basin Brakes |
+| --- | --- | --- |
+| capitals | L12H22, L10H1, L9H21, L10H0, L8H23, L10H5 | L9H23, L8H22, L8H18, L9H3, L11H7, L11H23 |
+| categories | L8H14, L12H7, L8H22, L12H22, L12H16, L12H9 | L10H0, L11H19, L11H22, L11H0, L12H10, L10H12 |
+| antonyms | L12H0, L12H17, L11H3, L9H23, L9H12, L10H18 | L11H0, L12H6, L11H22, L12H14, L9H18, L10H1 |
+
+Most actionable initial candidates:
+
+```text
+capital writer boost:
+  L12H22, L9H21, L10H0
+
+category brake release:
+  L10H0, L11H19, L11H22, L11H0
+
+antonym writer boost:
+  L12H0, L12H17, L11H3
+
+high-risk inversion controls:
+  category brakes above,
+  capital brake L9H23,
+  antonym brake L11H0
+```
+
+Interpretation:
+
+This is exactly the kind of result the signed-basin framing predicted. A head is
+not globally positive or negative. It has a write geometry whose task value
+depends on:
+
+```text
+which basin it writes to,
+the sign of that write,
+and whether that basin is target, source, contrast, or unrelated for the metric.
+```
+
+The first concrete next step is not full steering yet. It is polarity screening:
+
+```text
+1. Pick stable writers and stable brakes per suite.
+2. Implement signed-basin-steer:
+   writer boost
+   brake release
+   balanced writer-brake
+   brake inversion as high-risk comparison
+3. Evaluate with target token gain, target basin gain, source movement,
+   contrast suppression, unrelated drift, KL, and top-k drift.
+```

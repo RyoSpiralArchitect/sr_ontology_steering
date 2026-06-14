@@ -4086,6 +4086,417 @@ def logits_summary(tokenizer, logits: torch.Tensor, top_k: int) -> Dict[str, Any
     }
 
 
+# =============================================================================
+# 10.6 Signed semantic-basin probe utilities
+# =============================================================================
+
+SIGNED_BASIN_TASKS: Dict[str, List[Dict[str, Any]]] = {
+    "capitals": [
+        {
+            "id": "capital_france",
+            "prompt": "Answer with one word. The capital of France is",
+            "basins": {
+                "target": ["Paris"],
+                "source": ["France"],
+                "contrast": ["Rome", "Berlin", "Madrid", "London"],
+                "unrelated": ["cat", "blue", "banana"],
+            },
+        },
+        {
+            "id": "capital_italy",
+            "prompt": "Answer with one word. The capital of Italy is",
+            "basins": {
+                "target": ["Rome"],
+                "source": ["Italy"],
+                "contrast": ["Paris", "Berlin", "Madrid", "London"],
+                "unrelated": ["cat", "blue", "banana"],
+            },
+        },
+    ],
+    "categories": [
+        {
+            "id": "category_cat",
+            "prompt": "Answer with one word. A cat is a type of",
+            "basins": {
+                "target": ["animal", "mammal"],
+                "source": ["cat"],
+                "contrast": ["vehicle", "tool", "plant"],
+                "unrelated": ["Paris", "blue", "number"],
+            },
+        },
+        {
+            "id": "category_dog",
+            "prompt": "Answer with one word. A dog is a type of",
+            "basins": {
+                "target": ["animal", "mammal"],
+                "source": ["dog"],
+                "contrast": ["vehicle", "tool", "plant"],
+                "unrelated": ["Paris", "blue", "number"],
+            },
+        },
+    ],
+    "antonyms": [
+        {
+            "id": "antonym_hot",
+            "prompt": "Answer with one word. The opposite of hot is",
+            "basins": {
+                "target": ["cold"],
+                "source": ["hot"],
+                "contrast": ["warm", "heat"],
+                "unrelated": ["Paris", "animal", "number"],
+            },
+        },
+        {
+            "id": "antonym_black",
+            "prompt": "Answer with one word. The opposite of black is",
+            "basins": {
+                "target": ["white"],
+                "source": ["black"],
+                "contrast": ["dark", "night"],
+                "unrelated": ["Paris", "animal", "number"],
+            },
+        },
+    ],
+}
+
+
+def signed_basin_messages(prompt: str) -> List[Message]:
+    return [
+        {"role": "system", "content": "You answer concise factual prompts directly."},
+        {"role": "user", "content": prompt},
+    ]
+
+
+def basin_token_variants(term: str) -> List[str]:
+    variants = set()
+    base_forms = {term, term.strip(), term.lower(), term.capitalize()}
+
+    for form in base_forms:
+        if not form:
+            continue
+        variants.add(form)
+        variants.add(" " + form)
+
+    return sorted(variants)
+
+
+def basin_token_ids(tokenizer, terms: List[str]) -> List[int]:
+    ids = set()
+    fallback_ids = set()
+
+    for term in terms:
+        for variant in basin_token_variants(term):
+            encoded = tokenizer(variant, add_special_tokens=False).input_ids
+            if len(encoded) == 1:
+                ids.add(int(encoded[0]))
+            elif encoded:
+                fallback_ids.add(int(encoded[0]))
+
+    # Prefer exact one-token variants. Falling back to first tokens is only for
+    # basin terms that have no single-token spelling under the tokenizer.
+    return sorted(ids or fallback_ids)
+
+
+def prepare_basin_token_ids(tokenizer, basins: Dict[str, List[str]]) -> Dict[str, Dict[str, Any]]:
+    out = {}
+
+    for basin_name, terms in basins.items():
+        ids = basin_token_ids(tokenizer, terms)
+        out[basin_name] = {
+            "terms": terms,
+            "token_ids": ids,
+            "tokens": [tokenizer.decode([token_id]) for token_id in ids],
+        }
+
+    return out
+
+
+def signed_basin_next_token_summary(
+    tokenizer,
+    logits: torch.Tensor,
+    basin_ids: Dict[str, Dict[str, Any]],
+    top_k: int,
+) -> Dict[str, Any]:
+    float_logits = logits.detach().float()
+    probs = torch.softmax(float_logits, dim=-1)
+    basins = {}
+
+    for basin_name, info in basin_ids.items():
+        token_ids = info["token_ids"]
+        basins[basin_name] = {
+            **info,
+            "mass": token_mass(probs, token_ids),
+            "logit_mean": token_logit_mean(float_logits, token_ids),
+        }
+
+    target_logit = basins.get("target", {}).get("logit_mean")
+    source_logit = basins.get("source", {}).get("logit_mean")
+    contrast_logit = basins.get("contrast", {}).get("logit_mean")
+
+    return {
+        "top_tokens": top_next_tokens(tokenizer, probs, top_k=top_k),
+        "basins": basins,
+        "target_minus_source_logit": (
+            target_logit - source_logit
+            if target_logit is not None and source_logit is not None
+            else None
+        ),
+        "target_minus_contrast_logit": (
+            target_logit - contrast_logit
+            if target_logit is not None and contrast_logit is not None
+            else None
+        ),
+    }
+
+
+def collect_o_proj_input_cache(
+    model,
+    tokenizer,
+    layers,
+    messages: List[Message],
+    layer_indices: List[int],
+    device: torch.device,
+) -> Tuple[torch.Tensor, Dict[int, torch.Tensor], int]:
+    cache: Dict[int, torch.Tensor] = {}
+    handles = []
+
+    def make_hook(layer_idx: int):
+        def hook(module, inputs):
+            h = inputs[0]
+            cache[layer_idx] = h[:, -1, :].detach().float().cpu()
+            return None
+
+        return hook
+
+    try:
+        for layer_idx in layer_indices:
+            module = attention_o_proj_for_layer(layers, layer_idx)
+            handles.append(module.register_forward_pre_hook(make_hook(layer_idx)))
+
+        rendered = render_chat_text(tokenizer, messages)
+        inputs = format_chat(tokenizer, messages, tokenize=True, device=device)
+        outputs = circuit_forward(model, inputs, output_attentions=False)
+        logits = outputs.logits[0, -1, :]
+        n_tokens = int(inputs["input_ids"].shape[1])
+        _ = rendered
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    return logits, cache, n_tokens
+
+
+def selected_basin_unembed_weights(model, basin_ids: Dict[str, Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+    out = {}
+    lm_head = model.get_output_embeddings()
+    if lm_head is None or not hasattr(lm_head, "weight"):
+        raise ValueError("Model has no output embedding weight for basin write projection")
+
+    weight = lm_head.weight
+
+    for basin_name, info in basin_ids.items():
+        token_ids = info["token_ids"]
+        if not token_ids:
+            out[basin_name] = torch.empty((0, weight.shape[-1]), dtype=torch.float32)
+            continue
+        ids = torch.tensor(token_ids, dtype=torch.long, device=weight.device)
+        out[basin_name] = weight.index_select(0, ids).detach().float().cpu()
+
+    return out
+
+
+def direct_head_basin_write_rows(
+    model,
+    layers,
+    head_cache: Dict[int, torch.Tensor],
+    heads_by_layer: Dict[int, List[int]],
+    basin_weights: Dict[str, torch.Tensor],
+    head_dim: int,
+) -> List[Dict[str, Any]]:
+    rows = []
+
+    for layer_idx in sorted(heads_by_layer):
+        module = attention_o_proj_for_layer(layers, layer_idx)
+        weight = module.weight.detach().float().cpu()
+        h = head_cache[layer_idx][0]
+
+        for head_idx in heads_by_layer[layer_idx]:
+            start = head_idx * head_dim
+            end = start + head_dim
+            head_slice = h[start:end]
+            # Linear output is input @ weight.T. Attribute only this head's
+            # slice to the residual write before downstream layer mixing.
+            contribution = torch.matmul(head_slice, weight[:, start:end].T)
+            basin_write = {}
+
+            for basin_name, w in basin_weights.items():
+                if w.numel() == 0:
+                    basin_write[basin_name] = None
+                else:
+                    vals = torch.matmul(w, contribution)
+                    basin_write[basin_name] = float(vals.mean().item())
+
+            target = basin_write.get("target")
+            source = basin_write.get("source")
+            contrast = basin_write.get("contrast")
+            unrelated = basin_write.get("unrelated")
+
+            row = {
+                "layer": layer_idx,
+                "head": head_idx,
+                "target_write": target,
+                "source_write": source,
+                "contrast_write": contrast,
+                "unrelated_write": unrelated,
+                "target_minus_source_write": (
+                    target - source
+                    if target is not None and source is not None
+                    else None
+                ),
+                "target_minus_contrast_write": (
+                    target - contrast
+                    if target is not None and contrast is not None
+                    else None
+                ),
+                "target_minus_unrelated_write": (
+                    target - unrelated
+                    if target is not None and unrelated is not None
+                    else None
+                ),
+                "contribution_norm": float(contribution.norm().item()),
+            }
+            rows.append(row)
+
+    return rows
+
+
+def signed_basin_sort_value(row: Dict[str, Any], metric: str) -> float:
+    val = row.get(metric)
+    if val is None:
+        return float("-inf")
+    if metric.startswith("abs_"):
+        return abs(float(row.get(metric[4:], 0.0) or 0.0))
+    return float(val)
+
+
+def command_signed_basin_probe(args) -> None:
+    model, tokenizer, layers, device = load_model_and_tokenizer(args)
+    n_heads, head_dim, hidden_size = infer_attention_head_layout(model, layers)
+    layer_indices = parse_layer_indices(args.layers, len(layers)) if args.layers else [10]
+    validate_layer_indices(layer_indices, len(layers))
+    selected_heads = parse_head_specs(args.heads, len(layers), n_heads)
+
+    if selected_heads:
+        heads_by_layer = group_heads_by_layer(selected_heads)
+    else:
+        heads_by_layer = {
+            layer_idx: list(range(n_heads))
+            for layer_idx in layer_indices
+        }
+
+    records = []
+    print(
+        f"[signed-basin-probe] suites={args.suites} layers={layer_indices} "
+        f"n_heads={n_heads} head_dim={head_dim} hidden_size={hidden_size}"
+    )
+
+    for suite_name in args.suites:
+        if suite_name not in SIGNED_BASIN_TASKS:
+            raise ValueError(f"Unknown suite {suite_name!r}. Known: {sorted(SIGNED_BASIN_TASKS)}")
+
+        for item in SIGNED_BASIN_TASKS[suite_name][: args.max_items or None]:
+            messages = signed_basin_messages(item["prompt"])
+            basin_ids = prepare_basin_token_ids(tokenizer, item["basins"])
+            logits, head_cache, n_tokens = collect_o_proj_input_cache(
+                model=model,
+                tokenizer=tokenizer,
+                layers=layers,
+                messages=messages,
+                layer_indices=sorted(heads_by_layer),
+                device=device,
+            )
+            next_token = signed_basin_next_token_summary(
+                tokenizer=tokenizer,
+                logits=logits,
+                basin_ids=basin_ids,
+                top_k=args.top_k,
+            )
+            basin_weights = selected_basin_unembed_weights(model, basin_ids)
+            head_rows = direct_head_basin_write_rows(
+                model=model,
+                layers=layers,
+                head_cache=head_cache,
+                heads_by_layer=heads_by_layer,
+                basin_weights=basin_weights,
+                head_dim=head_dim,
+            )
+            sort_metric = args.sort_metric
+            if sort_metric.startswith("abs_"):
+                head_rows = sorted(
+                    head_rows,
+                    key=lambda row: abs(float(row.get(sort_metric[4:], 0.0) or 0.0)),
+                    reverse=True,
+                )
+            else:
+                head_rows = sorted(
+                    head_rows,
+                    key=lambda row: float(row.get(sort_metric, 0.0) or 0.0),
+                    reverse=True,
+                )
+
+            record = {
+                "experiment": "signed_basin_probe",
+                "suite": suite_name,
+                "item_id": item["id"],
+                "prompt": item["prompt"],
+                "messages": messages,
+                "n_tokens": n_tokens,
+                "layers": layer_indices,
+                "heads_by_layer": heads_by_layer,
+                "head_layout": {
+                    "n_heads": n_heads,
+                    "head_dim": head_dim,
+                    "hidden_size": hidden_size,
+                },
+                "basin_terms": item["basins"],
+                "next_token": next_token,
+                "head_writes": head_rows,
+            }
+            records.append(record)
+
+            print("\n" + "=" * 120)
+            print(f"[signed-basin] suite={suite_name} item={item['id']} tokens={n_tokens}")
+            for basin_name, summary in next_token["basins"].items():
+                print(
+                    f"  basin={basin_name:<10} "
+                    f"mass={summary['mass']:.6f} "
+                    f"logit={fmt_float(summary['logit_mean'])} "
+                    f"tokens={summary['tokens']}"
+                )
+            print(
+                f"  target-source={fmt_float(next_token['target_minus_source_logit'])} "
+                f"target-contrast={fmt_float(next_token['target_minus_contrast_logit'])}"
+            )
+            print("[top head writes]")
+            for row in head_rows[:args.top_heads]:
+                print(
+                    f"  L{row['layer']:>2}H{row['head']:>2} "
+                    f"target={fmt_float(row['target_write'])} "
+                    f"source={fmt_float(row['source_write'])} "
+                    f"contrast={fmt_float(row['contrast_write'])} "
+                    f"unrel={fmt_float(row['unrelated_write'])} "
+                    f"t-src={fmt_float(row['target_minus_source_write'])} "
+                    f"norm={fmt_float(row['contribution_norm'])}"
+                )
+
+    if args.save_jsonl:
+        os.makedirs(os.path.dirname(args.save_jsonl) or ".", exist_ok=True)
+        with open(args.save_jsonl, "w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print(f"[save] {args.save_jsonl}")
+
+
 def span_occlusion_summaries(
     model,
     tokenizer,
@@ -5746,6 +6157,49 @@ def parse_args():
     p_circuit.add_argument("--no-occlusion", action="store_true")
     p_circuit.add_argument("--save-jsonl", type=str, default=None)
 
+    p_basin = sub.add_parser("signed-basin-probe")
+    add_common_model_args(p_basin)
+    p_basin.add_argument(
+        "--suites",
+        nargs="*",
+        default=["capitals", "categories", "antonyms"],
+        choices=sorted(SIGNED_BASIN_TASKS),
+    )
+    p_basin.add_argument(
+        "--layers",
+        nargs="*",
+        default=["10"],
+        help="Layer specs like 8-12 or 10. Defaults to layer 10.",
+    )
+    p_basin.add_argument(
+        "--heads",
+        nargs="*",
+        default=None,
+        help="Optional head specs like 10:7 10:0. Defaults to all heads in --layers.",
+    )
+    p_basin.add_argument(
+        "--sort-metric",
+        choices=[
+            "target_write",
+            "source_write",
+            "contrast_write",
+            "unrelated_write",
+            "target_minus_source_write",
+            "target_minus_contrast_write",
+            "target_minus_unrelated_write",
+            "abs_target_write",
+            "abs_source_write",
+            "abs_contrast_write",
+            "abs_target_minus_source_write",
+            "contribution_norm",
+        ],
+        default="abs_target_write",
+    )
+    p_basin.add_argument("--max-items", type=int, default=None)
+    p_basin.add_argument("--top-k", type=int, default=8)
+    p_basin.add_argument("--top-heads", type=int, default=12)
+    p_basin.add_argument("--save-jsonl", type=str, default=None)
+
     p_patch = sub.add_parser("activation-patch")
     add_common_model_args(p_patch)
     p_patch.add_argument("--source-case", required=True)
@@ -5869,6 +6323,8 @@ def main():
         command_order_sensitivity(args)
     elif args.command == "circuit-probe":
         command_circuit_probe(args)
+    elif args.command == "signed-basin-probe":
+        command_signed_basin_probe(args)
     elif args.command == "activation-patch":
         command_activation_patch(args)
     elif args.command == "head-patch":
