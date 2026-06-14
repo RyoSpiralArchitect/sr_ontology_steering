@@ -699,3 +699,228 @@ affordance, and repair-scope information to flip the final distribution. The
 next target should be head-level patching inside the effective attention ranges,
 especially layers 8-15 and 12-27, with separate source/target pairs for
 affordance removal and capability repair.
+
+## Window, Leave-One-Out, And Cross-Entity Patch Follow-Up
+
+Local output files:
+
+```text
+../target/ontology_steer/llama32_3b_window_patch_1_refusal_to_repair.jsonl
+../target/ontology_steer/llama32_3b_window_patch_2_refusal_to_minus_affordance.jsonl
+../target/ontology_steer/llama32_3b_window_patch_3_repair_to_full.jsonl
+../target/ontology_steer/llama32_3b_leave_one_out_attn_12_27_1_refusal_to_repair.jsonl
+../target/ontology_steer/llama32_3b_leave_one_out_attn_12_27_2_refusal_to_minus_affordance.jsonl
+../target/ontology_steer/llama32_3b_leave_one_out_attn_12_27_3_repair_to_full.jsonl
+../target/ontology_steer/llama32_3b_cross_patch_clock_full_to_fish_minus_affordance.jsonl
+../target/ontology_steer/llama32_3b_cross_patch_fish_full_to_clock_minus_affordance.jsonl
+../target/ontology_steer/llama32_3b_cross_patch_statue_full_to_clock_minus_affordance.jsonl
+```
+
+The CLI now supports two narrower modes:
+
+```bash
+python ontology_steer_monolith.py activation-patch \
+  --patch-mode window \
+  --window-size 4
+```
+
+```bash
+python ontology_steer_monolith.py activation-patch \
+  --patch-mode leave-one-out \
+  --layers 12-27
+```
+
+### Four-Layer Window Patch
+
+| Pair | Source -> Target | Best `attn_out` Window | Source Effect | Margin Effect | Patched Refusal / Code | Best `mlp_out` Window | Source Effect |
+| --- | --- | --- | ---: | ---: | ---: | --- | ---: |
+| 1 | `full_spell` -> `full_then_waterproof_keyboard` | `12-15` | 0.148 | 0.607 | 0.066 / 0.749 | `20-23` | 0.013 |
+| 2 | `full_spell` -> `minus_affordance` | `12-15` | 0.761 | 0.669 | 0.621 / 0.111 | `12-15` | 0.329 |
+| 3 | `full_then_waterproof_keyboard` -> `full_spell` | `12-15` | 0.608 | 0.625 | 0.386 / 0.591 | `12-15` | 0.454 |
+
+Interpretation:
+
+The strongest four-layer attention window is consistently `12-15`. That window
+is especially strong for the affordance-removal contrast: patching only
+`attn_out 12-15` from the full fish spell into the minus-affordance/code target
+raises refusal mass to 0.621 and drops code mass to 0.111.
+
+But `12-15` alone is not the full story. Pair 1 only reaches source effect
+0.148 by mass, even though the earlier `12-27` range was near complete. This
+suggests a staged trajectory: layers 12-15 are the strongest local entry point,
+but later layers are needed to fully stabilize the refusal/code state.
+
+### Leave-One-Out From `attn_out 12-27`
+
+| Pair | Base Range | Worst Single Omission | Source Effect After Omission | Interpretation |
+| --- | --- | --- | ---: | --- |
+| 1 | `full_spell` -> `full_then_waterproof_keyboard` | omit L26 | 0.964 | No single layer is required |
+| 2 | `full_spell` -> `minus_affordance` | omit L26 | 0.989 | No single layer is required |
+| 3 | `full_then_waterproof_keyboard` -> `full_spell` | omit L27 | 0.990 | No single layer is required |
+
+Interpretation:
+
+The leave-one-out run argues against a brittle one-layer writer. Even removing
+the most damaging single layer leaves the `12-27` attention-output patch very
+strong. This narrows the claim:
+
+```text
+Window patch:
+  layer range 12-15 is the strongest local zone.
+
+Leave-one-out:
+  no individual layer in 12-27 is necessary on its own.
+
+Current best wording:
+  refusal/code trajectory is distributed and redundant across middle-to-late
+  attention outputs, with a strong local contribution around layers 12-15.
+```
+
+### Cross-Entity Activation Patch
+
+| Source -> Target | Best `attn_out` Range | Source Effect | Margin Effect | Patched Refusal / Code | Best `mlp_out` Range | Source Effect |
+| --- | --- | ---: | ---: | ---: | --- | ---: |
+| `clock_full` -> `fish_minus_affordance` | `12-27` | 1.008 | 0.952 | 0.932 / 0.011 | `12-27` | 0.700 |
+| `fish_full` -> `clock_minus_affordance` | `12-27` | 1.000 | 0.889 | 0.980 / 0.001 | `12-27` | 0.594 |
+| `statue_full` -> `clock_minus_affordance` | `12-27` | 1.011 | 0.946 | 0.839 / 0.000 | `12-27` | 0.749 |
+
+Interpretation:
+
+The cross-entity probes make the strongest case so far that the patched state is
+not merely fish-specific. A clock full-spell refusal trajectory transfers into a
+fish minus-affordance/code target, and fish or statue full-spell trajectories
+transfer into a clock minus-affordance/code target.
+
+This supports an entity-general incapability/refusal trajectory:
+
+```text
+full world-state + practical incapability
+  -> middle-to-late attention trajectory
+  -> late refusal/code decision state
+
+entity identity still matters for prompt-level behavior,
+but the patched refusal trajectory can generalize across entities.
+```
+
+Updated next step:
+
+Head-level patching should focus on layers 12-15 first, but the leave-one-out
+result says not to expect a single decisive layer. Start with all-heads by layer
+for L12, L13, L14, and L15, then move to single-head and all-but-one head
+patches. The attention-mass candidates from the circuit probe remain useful
+priors, but they are not yet causal evidence.
+
+## Head Patch: First Localization Pass
+
+Local output files:
+
+```text
+../target/ontology_steer/llama32_3b_head_all_layers_12_15_refusal_to_minus_affordance.jsonl
+../target/ontology_steer/llama32_3b_head_affordance_candidates_refusal_to_minus_affordance.jsonl
+../target/ontology_steer/llama32_3b_head_repair_candidates_repair_to_full.jsonl
+../target/ontology_steer/llama32_3b_head_all_but_one_12_15_refusal_to_minus_affordance.jsonl
+```
+
+The `head-patch` command patches attention head slices at the input to each
+attention layer's `o_proj`. For Llama 3B in this run, the inferred layout was:
+
+```text
+n_heads = 24
+head_dim = 128
+hidden_size = 3072
+```
+
+### All-Heads By Layer
+
+Command shape:
+
+```bash
+python ontology_steer_monolith.py head-patch \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case ablate_00_full_spell \
+  --target-case ablate_03_full_minus_affordance \
+  --mode all-heads \
+  --layers 12 13 14 15 \
+  --save-jsonl ../target/ontology_steer/llama32_3b_head_all_layers_12_15_refusal_to_minus_affordance.jsonl
+```
+
+| Patch | Source Effect | Margin Effect | Patched Refusal / Code |
+| --- | ---: | ---: | ---: |
+| L12 all heads | 0.034 | 0.409 | 0.009 / 0.931 |
+| L13 all heads | 0.004 | 0.220 | 0.001 / 0.983 |
+| L14 all heads | 0.002 | 0.229 | 0.000 / 0.987 |
+| L15 all heads | 0.000 | 0.205 | 0.001 / 0.990 |
+
+Interpretation:
+
+Patching all heads in a single layer is much weaker than patching the whole
+`attn_out 12-15` window. L12 is the strongest single layer in this pre-`o_proj`
+head-slice view, but it still only reaches source effect 0.034 by mass. The
+larger `attn_out 12-15` window effect therefore does not reduce to one layer's
+head-concat output.
+
+### Attention-Mass Candidate Heads
+
+Affordance candidates on `full_spell -> minus_affordance`:
+
+| Patch | Source Effect | Margin Effect | Patched Refusal / Code |
+| --- | ---: | ---: | ---: |
+| L12H16 + L14H10 | 0.006 | 0.171 | 0.000 / 0.978 |
+| L12H16 | 0.005 | 0.141 | 0.000 / 0.981 |
+| L14H10 | 0.000 | 0.026 | 0.000 / 0.989 |
+
+Repair candidates on `full_then_waterproof_keyboard -> full_spell`:
+
+| Patch | Source Effect | Margin Effect | Patched Refusal / Code |
+| --- | ---: | ---: | ---: |
+| L15H1 | 0.001 | 0.029 | 0.977 / 0.001 |
+| L14H11 + L15H1 + L15H17 | 0.001 | 0.036 | 0.978 / 0.001 |
+| L15H17 | -0.000 | 0.006 | 0.980 / 0.000 |
+| L14H11 | -0.001 | -0.001 | 0.981 / 0.000 |
+
+Interpretation:
+
+The attention-mass candidates are not sufficient causal heads in this patching
+setup. L14H10, which was a strong affordance-attention candidate, barely moves
+the distribution when its head slice alone is patched. L12H16 is stronger but
+still tiny compared with the layer/window effects. This is a useful negative
+result: high attention mass is not the same thing as a localized writer.
+
+### All-But-One Within L12-L15
+
+The largest same-layer drop was:
+
+| Omission | Same-Layer All-Heads Source Effect | Omitted Source Effect | Drop | Margin Drop |
+| --- | ---: | ---: | ---: | ---: |
+| L12 except H16 | 0.034 | 0.014 | 0.0206 | 0.1436 |
+| L12 except H17 | 0.034 | 0.019 | 0.0151 | 0.1065 |
+| L12 except H3 | 0.034 | 0.022 | 0.0126 | 0.0049 |
+| L12 except H5 | 0.034 | 0.024 | 0.0103 | 0.0746 |
+
+Interpretation:
+
+L12H16 is the best current head-level causal candidate, because removing it from
+L12 all-heads causes the largest same-layer drop and patching L12H16 alone is
+the strongest of the affordance candidates. But the absolute effect is still
+small. This points to a distributed, multi-head and multi-layer trajectory
+rather than a single decisive head.
+
+Updated localization claim:
+
+```text
+Strong:
+  L12-L15 is the strongest local window.
+  L12 is the strongest single pre-o_proj all-head layer.
+  L12H16 is the best current head-level candidate.
+
+Still not established:
+  any single causal head.
+  L14H10 as a writer.
+  whether o_proj-input head slices are the right decomposition point.
+
+Next:
+  patch all heads across multiple layers jointly,
+  then implement span-restricted head contribution patching.
+```

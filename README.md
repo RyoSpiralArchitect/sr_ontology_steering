@@ -263,6 +263,60 @@ python ontology_steer_monolith.py activation-patch \
   --save-jsonl target/ontology_steer/llama32_3b_range_patch_1_refusal_to_repair.jsonl
 ```
 
+Patch fixed-width windows or leave one layer out of a strong range:
+
+```bash
+python ontology_steer_monolith.py activation-patch \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case ablate_00_full_spell \
+  --target-case ablate_03_full_minus_affordance \
+  --components attn_out mlp_out \
+  --patch-mode window \
+  --window-size 4 \
+  --save-jsonl target/ontology_steer/llama32_3b_window_patch_2_refusal_to_minus_affordance.jsonl
+```
+
+```bash
+python ontology_steer_monolith.py activation-patch \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case ablate_00_full_spell \
+  --target-case ablate_03_full_minus_affordance \
+  --components attn_out \
+  --patch-mode leave-one-out \
+  --layers 12-27 \
+  --save-jsonl target/ontology_steer/llama32_3b_leave_one_out_attn_12_27_2_refusal_to_minus_affordance.jsonl
+```
+
+Patch attention head slices at the input to each layer's attention `o_proj`:
+
+```bash
+python ontology_steer_monolith.py head-patch \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case ablate_00_full_spell \
+  --target-case ablate_03_full_minus_affordance \
+  --mode all-heads \
+  --layers 12 13 14 15 \
+  --save-jsonl target/ontology_steer/llama32_3b_head_all_layers_12_15_refusal_to_minus_affordance.jsonl
+```
+
+```bash
+python ontology_steer_monolith.py head-patch \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case ablate_00_full_spell \
+  --target-case ablate_03_full_minus_affordance \
+  --mode selected-heads \
+  --heads 14:10 12:16 \
+  --save-jsonl target/ontology_steer/llama32_3b_head_affordance_candidates_refusal_to_minus_affordance.jsonl
+```
+
 ## Current Findings
 
 Early local runs suggest:
@@ -329,6 +383,20 @@ Early local runs suggest:
   patching is weaker for refusal insertion but strong for repair/code insertion.
   This supports a distributed writer/routing account rather than a single-layer
   vector account.
+- Window patching localizes the strongest single 4-layer window to `12-15`, but
+  that window alone does not explain the full `12-27` effect. Leave-one-layer-out
+  patching over `attn_out 12-27` remains strong after removing any single layer,
+  supporting a redundant distributed trajectory rather than a brittle one-layer
+  writer.
+- Cross-entity activation patching transfers refusal trajectories across fish,
+  clock, and statue prompts. `attn_out 12-27` can move a held-out clock or statue
+  full-spell refusal state into a different entity's minus-affordance/code
+  target, which strengthens the entity-general affordance/incapability story.
+- Initial head-slice patching does not isolate a single causal head. All-heads
+  by layer is weak compared with full `attn_out` window patching, and attention
+  mass candidates such as L14/H10 or L12/H16 are weak when patched alone. L12/H16
+  is the largest all-but-one contributor inside L12, but it is not sufficient by
+  itself.
 
 That last failure is the interesting part: it narrows the next experiment to
 separating identity, affordance, interpretation scope, and override grammar.

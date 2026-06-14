@@ -3680,6 +3680,242 @@ def patched_target_logits_multi(
             handle.remove()
 
 
+def attention_module_for_layer(layers, layer_idx: int):
+    block = layers[layer_idx]
+    if not hasattr(block, "self_attn"):
+        raise ValueError(f"Layer {layer_idx} has no self_attn module")
+    return block.self_attn
+
+
+def attention_o_proj_for_layer(layers, layer_idx: int):
+    attn = attention_module_for_layer(layers, layer_idx)
+    if not hasattr(attn, "o_proj"):
+        raise ValueError(f"Layer {layer_idx} attention has no o_proj module")
+    return attn.o_proj
+
+
+def infer_attention_head_layout(model, layers) -> Tuple[int, int, int]:
+    first_attn = attention_module_for_layer(layers, 0)
+    n_heads = getattr(first_attn, "num_heads", None)
+    if n_heads is None:
+        n_heads = getattr(first_attn, "num_attention_heads", None)
+    if n_heads is None and hasattr(model, "config"):
+        n_heads = getattr(model.config, "num_attention_heads", None)
+    if n_heads is None:
+        raise ValueError("Could not infer number of attention heads")
+
+    o_proj = attention_o_proj_for_layer(layers, 0)
+    hidden_size = getattr(o_proj, "in_features", None)
+    if hidden_size is None and hasattr(model, "config"):
+        hidden_size = getattr(model.config, "hidden_size", None)
+    if hidden_size is None:
+        raise ValueError("Could not infer attention o_proj input size")
+
+    head_dim = getattr(first_attn, "head_dim", None)
+    if head_dim is None:
+        if hidden_size % int(n_heads) != 0:
+            raise ValueError(
+                f"Cannot infer head_dim: hidden_size={hidden_size}, n_heads={n_heads}"
+            )
+        head_dim = int(hidden_size) // int(n_heads)
+
+    if int(n_heads) * int(head_dim) != int(hidden_size):
+        raise ValueError(
+            f"Head layout mismatch: n_heads={n_heads}, head_dim={head_dim}, hidden_size={hidden_size}"
+        )
+
+    return int(n_heads), int(head_dim), int(hidden_size)
+
+
+def parse_head_specs(specs: Optional[List[str]], n_layers: int, n_heads: int) -> List[Tuple[int, int]]:
+    if not specs:
+        return []
+
+    out = []
+
+    for spec in specs:
+        for part in str(spec).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" not in part:
+                raise ValueError(f"Head spec must be layer:head, got {part!r}")
+            layer_s, head_s = part.split(":", 1)
+            layer_idx = int(layer_s)
+            head_idx = int(head_s)
+            if layer_idx < 0 or layer_idx >= n_layers:
+                raise ValueError(f"Layer index out of range in head spec: {part!r}")
+            if head_idx < 0 or head_idx >= n_heads:
+                raise ValueError(f"Head index out of range in head spec: {part!r}")
+            out.append((layer_idx, head_idx))
+
+    seen = set()
+    uniq = []
+    for item in out:
+        if item not in seen:
+            seen.add(item)
+            uniq.append(item)
+    return uniq
+
+
+def group_heads_by_layer(heads: List[Tuple[int, int]]) -> Dict[int, List[int]]:
+    grouped: Dict[int, List[int]] = defaultdict(list)
+    for layer_idx, head_idx in heads:
+        grouped[layer_idx].append(head_idx)
+    return {
+        layer_idx: sorted(set(head_idxs))
+        for layer_idx, head_idxs in grouped.items()
+    }
+
+
+def format_head_label(heads_by_layer: Dict[int, List[int]], max_items: int = 5) -> str:
+    parts = []
+    for layer_idx in sorted(heads_by_layer):
+        head_idxs = heads_by_layer[layer_idx]
+        if len(head_idxs) == 1:
+            parts.append(f"L{layer_idx}H{head_idxs[0]}")
+        elif len(head_idxs) <= 4:
+            parts.append(f"L{layer_idx}H{','.join(str(h) for h in head_idxs)}")
+        else:
+            parts.append(f"L{layer_idx}H{head_idxs[0]}..{head_idxs[-1]}_{len(head_idxs)}")
+
+    if len(parts) <= max_items:
+        return "+".join(parts)
+    return "+".join(parts[:max_items]) + f"+{len(parts) - max_items}more"
+
+
+def build_head_patch_plans(
+    mode: str,
+    layer_indices: List[int],
+    selected_heads: List[Tuple[int, int]],
+    n_heads: int,
+) -> List[Dict[str, Any]]:
+    plans = []
+
+    if mode == "all-heads":
+        if not layer_indices:
+            raise ValueError("all-heads mode requires --layers")
+        for layer_idx in layer_indices:
+            heads_by_layer = {layer_idx: list(range(n_heads))}
+            plans.append({
+                "patch_label": f"L{layer_idx}:all",
+                "heads_by_layer": heads_by_layer,
+                "layer": layer_idx,
+                "head": None,
+                "omitted_head": None,
+            })
+        return plans
+
+    if mode == "selected-heads":
+        if not selected_heads:
+            raise ValueError("selected-heads mode requires --heads")
+
+        if len(selected_heads) > 1:
+            heads_by_layer = group_heads_by_layer(selected_heads)
+            plans.append({
+                "patch_label": format_head_label(heads_by_layer),
+                "heads_by_layer": heads_by_layer,
+                "layer": None,
+                "head": None,
+                "omitted_head": None,
+            })
+
+        for layer_idx, head_idx in selected_heads:
+            plans.append({
+                "patch_label": f"L{layer_idx}H{head_idx}",
+                "heads_by_layer": {layer_idx: [head_idx]},
+                "layer": layer_idx,
+                "head": head_idx,
+                "omitted_head": None,
+            })
+        return plans
+
+    if mode == "all-but-one":
+        if not layer_indices:
+            raise ValueError("all-but-one mode requires --layers")
+        for layer_idx in layer_indices:
+            for omitted_head in range(n_heads):
+                heads = [head_idx for head_idx in range(n_heads) if head_idx != omitted_head]
+                plans.append({
+                    "patch_label": f"L{layer_idx}:all_except_H{omitted_head}",
+                    "heads_by_layer": {layer_idx: heads},
+                    "layer": layer_idx,
+                    "head": None,
+                    "omitted_head": omitted_head,
+                })
+        return plans
+
+    raise ValueError(f"Unknown head patch mode: {mode}")
+
+
+def collect_source_head_cache(
+    model,
+    tokenizer,
+    layers,
+    messages: List[Message],
+    layer_indices: List[int],
+    device: torch.device,
+) -> Tuple[torch.Tensor, Dict[int, torch.Tensor]]:
+    cache: Dict[int, torch.Tensor] = {}
+    handles = []
+
+    def make_hook(layer_idx: int):
+        def hook(module, inputs):
+            h = inputs[0]
+            cache[layer_idx] = h[:, -1, :].detach().float().cpu()
+            return None
+
+        return hook
+
+    try:
+        for layer_idx in layer_indices:
+            module = attention_o_proj_for_layer(layers, layer_idx)
+            handles.append(module.register_forward_pre_hook(make_hook(layer_idx)))
+
+        logits = forward_logits_for_messages(model, tokenizer, messages, device)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    return logits, cache
+
+
+def patched_target_logits_heads(
+    model,
+    tokenizer,
+    layers,
+    target_messages: List[Message],
+    heads_by_layer: Dict[int, List[int]],
+    source_cache: Dict[int, torch.Tensor],
+    head_dim: int,
+    device: torch.device,
+) -> torch.Tensor:
+    handles = []
+
+    def make_hook(layer_idx: int, head_idxs: List[int]):
+        def hook(module, inputs):
+            h = inputs[0]
+            source_vec = source_cache[layer_idx].to(device=h.device, dtype=h.dtype)
+            h2 = h.clone()
+            for head_idx in head_idxs:
+                start = head_idx * head_dim
+                end = start + head_dim
+                h2[:, -1, start:end] = source_vec[:, start:end]
+            return (h2, *inputs[1:])
+
+        return hook
+
+    try:
+        for layer_idx, head_idxs in heads_by_layer.items():
+            module = attention_o_proj_for_layer(layers, layer_idx)
+            handles.append(module.register_forward_pre_hook(make_hook(layer_idx, head_idxs)))
+
+        return forward_logits_for_messages(model, tokenizer, target_messages, device)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
 def normalized_patch_effect(patched: float, target: float, source: float) -> Optional[float]:
     denom = source - target
     if abs(denom) < 1e-9:
@@ -3698,6 +3934,93 @@ def maybe_delta(left: Optional[float], right: Optional[float]) -> Optional[float
     if left is None or right is None:
         return None
     return left - right
+
+
+def compact_layer_span(layer_indices: List[int]) -> str:
+    if not layer_indices:
+        return "-"
+    if len(layer_indices) == 1:
+        return str(layer_indices[0])
+
+    sorted_layers = sorted(layer_indices)
+    is_contiguous = sorted_layers == list(range(sorted_layers[0], sorted_layers[-1] + 1))
+
+    if is_contiguous:
+        return f"{sorted_layers[0]}-{sorted_layers[-1]}"
+
+    if len(sorted_layers) <= 6:
+        return ",".join(str(idx) for idx in sorted_layers)
+
+    return f"{sorted_layers[0]}..{sorted_layers[-1]}_{len(sorted_layers)}"
+
+
+def build_patch_layer_plans(
+    patch_mode: str,
+    layer_indices: List[int],
+    range_end: int,
+    window_size: int,
+) -> List[Dict[str, Any]]:
+    if window_size <= 0:
+        raise ValueError(f"window_size must be positive, got {window_size}")
+
+    plans = []
+
+    if patch_mode == "single":
+        for layer_idx in layer_indices:
+            plans.append({
+                "layer": layer_idx,
+                "patch_layers": [layer_idx],
+                "patch_label": str(layer_idx),
+                "omitted_layer": None,
+            })
+        return plans
+
+    if patch_mode == "range":
+        for start_idx in layer_indices:
+            if start_idx > range_end:
+                raise ValueError(
+                    f"Range patch start layer {start_idx} is after range_end={range_end}"
+                )
+            patch_layers = list(range(start_idx, range_end + 1))
+            plans.append({
+                "layer": start_idx,
+                "patch_layers": patch_layers,
+                "patch_label": compact_layer_span(patch_layers),
+                "omitted_layer": None,
+            })
+        return plans
+
+    if patch_mode == "window":
+        for start_idx in layer_indices:
+            if start_idx > range_end:
+                raise ValueError(
+                    f"Window patch start layer {start_idx} is after range_end={range_end}"
+                )
+            patch_layers = list(range(start_idx, min(start_idx + window_size - 1, range_end) + 1))
+            plans.append({
+                "layer": start_idx,
+                "patch_layers": patch_layers,
+                "patch_label": compact_layer_span(patch_layers),
+                "omitted_layer": None,
+            })
+        return plans
+
+    if patch_mode == "leave-one-out":
+        if len(layer_indices) < 2:
+            raise ValueError("leave-one-out requires at least two layers in --layers")
+        base_label = compact_layer_span(layer_indices)
+
+        for omitted_layer in layer_indices:
+            patch_layers = [layer_idx for layer_idx in layer_indices if layer_idx != omitted_layer]
+            plans.append({
+                "layer": omitted_layer,
+                "patch_layers": patch_layers,
+                "patch_label": f"{base_label}_except_{omitted_layer}",
+                "omitted_layer": omitted_layer,
+            })
+        return plans
+
+    raise ValueError(f"Unknown patch mode: {patch_mode}")
 
 
 def patch_record_score(source_summary: Dict[str, Any], target_summary: Dict[str, Any], patched_summary: Dict[str, Any]) -> Dict[str, Any]:
@@ -3741,26 +4064,29 @@ def patch_record_score(source_summary: Dict[str, Any], target_summary: Dict[str,
 
 def command_activation_patch(args) -> None:
     model, tokenizer, layers, device = load_model_and_tokenizer(args)
-    layer_indices = parse_layer_indices(args.layers, len(layers))
     components = args.components or PATCH_COMPONENTS
     range_end = args.range_end if args.range_end is not None else len(layers) - 1
 
     if range_end < 0 or range_end >= len(layers):
         raise ValueError(f"range_end out of range: {range_end}; n_layers={len(layers)}")
 
-    if args.patch_mode == "range":
-        for layer_idx in layer_indices:
-            if layer_idx > range_end:
-                raise ValueError(
-                    f"Range patch start layer {layer_idx} is after range_end={range_end}"
-                )
-        cache_layer_indices = sorted({
-            idx
-            for start in layer_indices
-            for idx in range(start, range_end + 1)
-        })
+    if args.patch_mode == "window" and not args.layers:
+        window_stride = args.window_stride if args.window_stride is not None else args.window_size
+        layer_indices = list(range(0, range_end + 1, window_stride))
     else:
-        cache_layer_indices = layer_indices
+        layer_indices = parse_layer_indices(args.layers, len(layers))
+
+    patch_plans = build_patch_layer_plans(
+        patch_mode=args.patch_mode,
+        layer_indices=layer_indices,
+        range_end=range_end,
+        window_size=args.window_size,
+    )
+    cache_layer_indices = sorted({
+        layer_idx
+        for plan in patch_plans
+        for layer_idx in plan["patch_layers"]
+    })
 
     for component in components:
         if component not in PATCH_COMPONENTS:
@@ -3774,7 +4100,8 @@ def command_activation_patch(args) -> None:
     print(
         f"[activation-patch] source={args.source_case} "
         f"target={args.target_case} mode={args.patch_mode} "
-        f"layers={layer_indices} range_end={range_end} components={components}"
+        f"layers={layer_indices} range_end={range_end} "
+        f"window_size={args.window_size} components={components}"
     )
 
     source_logits, source_cache = collect_source_patch_cache(
@@ -3803,12 +4130,8 @@ def command_activation_patch(args) -> None:
     records = []
 
     for component in components:
-        for start_idx in layer_indices:
-            if args.patch_mode == "range":
-                patch_layers = list(range(start_idx, range_end + 1))
-            else:
-                patch_layers = [start_idx]
-
+        for plan in patch_plans:
+            patch_layers = plan["patch_layers"]
             missing = [
                 (component, layer_idx)
                 for layer_idx in patch_layers
@@ -3832,20 +4155,16 @@ def command_activation_patch(args) -> None:
             )
             patched_summary = logits_summary(tokenizer, logits, top_k=args.top_k)
             score = patch_record_score(source_summary, target_summary, patched_summary)
-            patch_label = (
-                f"{patch_layers[0]}-{patch_layers[-1]}"
-                if len(patch_layers) > 1
-                else str(patch_layers[0])
-            )
             record = {
                 "source_case": args.source_case,
                 "target_case": args.target_case,
                 "patch_mode": args.patch_mode,
                 "component": component,
-                "layer": start_idx,
+                "layer": plan["layer"],
                 "range_start": patch_layers[0],
                 "range_end": patch_layers[-1],
-                "patch_label": patch_label,
+                "patch_label": plan["patch_label"],
+                "omitted_layer": plan.get("omitted_layer"),
                 "layers_patched": patch_layers,
                 "n_layers_patched": len(patch_layers),
                 "source": source_summary,
@@ -3889,6 +4208,161 @@ def command_activation_patch(args) -> None:
             f"{fmt_float(row.get('refusal_delta'), 9)}  "
             f"{fmt_float(row.get('code_delta'), 9)}  "
             f"{fmt_float(row.get('margin_delta'), 9)}  "
+            f"{fmt_float(row['patched']['refusal_mass'], 11)}  "
+            f"{fmt_float(row['patched']['code_mass'], 12)}  "
+            f"{fmt_float(row['patched'].get('logit_margin'), 9)}"
+        )
+
+    if args.save_jsonl:
+        os.makedirs(os.path.dirname(args.save_jsonl) or ".", exist_ok=True)
+        with open(args.save_jsonl, "w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print(f"[save] {args.save_jsonl}")
+
+
+def command_head_patch(args) -> None:
+    model, tokenizer, layers, device = load_model_and_tokenizer(args)
+    n_heads, head_dim, hidden_size = infer_attention_head_layout(model, layers)
+    layer_indices = parse_layer_indices(args.layers, len(layers)) if args.layers else []
+    selected_heads = parse_head_specs(args.heads, len(layers), n_heads)
+    plans = build_head_patch_plans(
+        mode=args.mode,
+        layer_indices=layer_indices,
+        selected_heads=selected_heads,
+        n_heads=n_heads,
+    )
+    cache_layer_indices = sorted({
+        layer_idx
+        for plan in plans
+        for layer_idx in plan["heads_by_layer"]
+    })
+
+    source_cases = selected_cases([args.source_case])
+    target_cases = selected_cases([args.target_case])
+    source_messages = source_cases[args.source_case]
+    target_messages = target_cases[args.target_case]
+
+    print(
+        f"[head-patch] source={args.source_case} target={args.target_case} "
+        f"mode={args.mode} layers={layer_indices} heads={selected_heads}"
+    )
+    print(
+        f"[head-layout] n_heads={n_heads} head_dim={head_dim} hidden_size={hidden_size} "
+        f"plans={len(plans)}"
+    )
+
+    source_logits, source_cache = collect_source_head_cache(
+        model=model,
+        tokenizer=tokenizer,
+        layers=layers,
+        messages=source_messages,
+        layer_indices=cache_layer_indices,
+        device=device,
+    )
+    target_logits = forward_logits_for_messages(model, tokenizer, target_messages, device)
+    source_summary = logits_summary(tokenizer, source_logits, top_k=args.top_k)
+    target_summary = logits_summary(tokenizer, target_logits, top_k=args.top_k)
+
+    print(
+        "[base] "
+        f"source_refusal={source_summary['refusal_mass']:.6f} "
+        f"source_code={source_summary['code_mass']:.6f} "
+        f"source_margin={fmt_float(source_summary.get('logit_margin'), 8).strip()} "
+        f"target_refusal={target_summary['refusal_mass']:.6f} "
+        f"target_code={target_summary['code_mass']:.6f} "
+        f"target_margin={fmt_float(target_summary.get('logit_margin'), 8).strip()}"
+    )
+
+    records = []
+
+    for plan in plans:
+        heads_by_layer = plan["heads_by_layer"]
+        missing_layers = [
+            layer_idx
+            for layer_idx in heads_by_layer
+            if layer_idx not in source_cache
+        ]
+        if missing_layers:
+            print(f"[warn] missing source head cache for layers {missing_layers}")
+            continue
+
+        logits = patched_target_logits_heads(
+            model=model,
+            tokenizer=tokenizer,
+            layers=layers,
+            target_messages=target_messages,
+            heads_by_layer=heads_by_layer,
+            source_cache=source_cache,
+            head_dim=head_dim,
+            device=device,
+        )
+        patched_summary = logits_summary(tokenizer, logits, top_k=args.top_k)
+        score = patch_record_score(source_summary, target_summary, patched_summary)
+        heads_flat = [
+            {"layer": layer_idx, "head": head_idx}
+            for layer_idx in sorted(heads_by_layer)
+            for head_idx in heads_by_layer[layer_idx]
+        ]
+        record = {
+            "source_case": args.source_case,
+            "target_case": args.target_case,
+            "head_patch_mode": args.mode,
+            "patch_label": plan["patch_label"],
+            "layer": plan.get("layer"),
+            "head": plan.get("head"),
+            "omitted_head": plan.get("omitted_head"),
+            "heads_by_layer": heads_by_layer,
+            "heads": heads_flat,
+            "n_heads_patched": len(heads_flat),
+            "head_layout": {
+                "n_heads": n_heads,
+                "head_dim": head_dim,
+                "hidden_size": hidden_size,
+            },
+            "source": source_summary,
+            "target": target_summary,
+            "patched": patched_summary,
+            **score,
+        }
+        records.append(record)
+
+    reverse = args.mode != "all-but-one"
+    records_sorted = sorted(
+        records,
+        key=lambda row: (
+            float("inf")
+            if row.get("source_effect") is None and not reverse
+            else float("-inf")
+            if row.get("source_effect") is None
+            else float(row["source_effect"])
+        ),
+        reverse=reverse,
+    )
+
+    print("\n" + "=" * 120)
+    if args.mode == "all-but-one":
+        print("[head-patch most damaging omissions]")
+    else:
+        print("[head-patch leaderboard]")
+    print("=" * 120)
+    header = (
+        f"{'rank':>4}  {'patch':>28}  {'n':>4}  "
+        f"{'src_eff':>8}  {'ref_eff':>8}  {'code_eff':>8}  {'marg_eff':>8}  "
+        f"{'patched_ref':>11}  {'patched_code':>12}  {'patched_m':>9}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for i, row in enumerate(records_sorted[:args.top_k_rows], start=1):
+        print(
+            f"{i:>4}  "
+            f"{row['patch_label'][:28]:>28}  "
+            f"{row['n_heads_patched']:>4}  "
+            f"{fmt_float(row.get('source_effect'), 8)}  "
+            f"{fmt_float(row.get('refusal_effect'), 8)}  "
+            f"{fmt_float(row.get('code_effect'), 8)}  "
+            f"{fmt_float(row.get('margin_effect'), 8)}  "
             f"{fmt_float(row['patched']['refusal_mass'], 11)}  "
             f"{fmt_float(row['patched']['code_mass'], 12)}  "
             f"{fmt_float(row['patched'].get('logit_margin'), 9)}"
@@ -4122,23 +4596,61 @@ def parse_args():
         "--layers",
         nargs="*",
         default=None,
-        help="Layer specs like 0-27 or 8 12 14. In range mode these are start layers.",
+        help="Layer specs like 0-27 or 8 12 14. In range/window mode these are start layers; in leave-one-out mode this is the base layer set.",
     )
     p_patch.add_argument(
         "--patch-mode",
-        choices=["single", "range"],
+        choices=["single", "range", "window", "leave-one-out"],
         default="single",
-        help="single patches one layer at a time; range patches each start layer through --range-end.",
+        help="single patches one layer at a time; range patches each start layer through --range-end; window patches fixed-width windows; leave-one-out patches a base set while omitting one layer per record.",
     )
     p_patch.add_argument(
         "--range-end",
         type=int,
         default=None,
-        help="Inclusive end layer for --patch-mode range. Defaults to the final model layer.",
+        help="Inclusive end layer for range/window modes. Defaults to the final model layer.",
+    )
+    p_patch.add_argument(
+        "--window-size",
+        type=int,
+        default=4,
+        help="Number of layers per window for --patch-mode window.",
+    )
+    p_patch.add_argument(
+        "--window-stride",
+        type=int,
+        default=None,
+        help="Start-layer stride for --patch-mode window when --layers is omitted. Defaults to --window-size.",
     )
     p_patch.add_argument("--top-k", type=int, default=8)
     p_patch.add_argument("--top-k-rows", type=int, default=20)
     p_patch.add_argument("--save-jsonl", type=str, default=None)
+
+    p_head = sub.add_parser("head-patch")
+    add_common_model_args(p_head)
+    p_head.add_argument("--source-case", required=True)
+    p_head.add_argument("--target-case", required=True)
+    p_head.add_argument(
+        "--mode",
+        choices=["all-heads", "selected-heads", "all-but-one"],
+        required=True,
+        help="Patch all heads by layer, selected layer:head specs, or all heads except one per layer.",
+    )
+    p_head.add_argument(
+        "--layers",
+        nargs="*",
+        default=None,
+        help="Layer specs for all-heads/all-but-one, e.g. 12 13 14 15.",
+    )
+    p_head.add_argument(
+        "--heads",
+        nargs="*",
+        default=None,
+        help="Head specs for selected-heads, e.g. 14:10 12:16.",
+    )
+    p_head.add_argument("--top-k", type=int, default=8)
+    p_head.add_argument("--top-k-rows", type=int, default=20)
+    p_head.add_argument("--save-jsonl", type=str, default=None)
 
     p_compare = sub.add_parser("compare-runs")
     p_compare.add_argument(
@@ -4181,6 +4693,8 @@ def main():
         command_circuit_probe(args)
     elif args.command == "activation-patch":
         command_activation_patch(args)
+    elif args.command == "head-patch":
+        command_head_patch(args)
     elif args.command == "compare-runs":
         command_compare_runs(args)
     else:
