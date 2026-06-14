@@ -208,3 +208,119 @@ model out of the fish state, while "treat it as fiction" did. That points toward
 override grammar rather than override strength. The model appears more
 responsive to a usable execution frame than to a bare negation of the previous
 frame.
+
+## Scope-Binder Ablation And Capability-Order Sweep
+
+Local command:
+
+```bash
+python ontology_steer_monolith.py baseline \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --cases \
+    ablate_00_full_spell \
+    ablate_01_full_minus_identity \
+    ablate_02_full_minus_actuality \
+    ablate_03_full_minus_affordance \
+    ablate_04_full_minus_scope \
+    ablate_05_scope_binder_only \
+    ablate_06_identity_plus_scope \
+    ablate_07_affordance_plus_scope \
+    ablate_08_identity_affordance_scope \
+    ablate_09_actuality_affordance_scope \
+    cap_order_00_full_then_waterproof_keyboard \
+    cap_order_01_waterproof_keyboard_then_full \
+    cap_order_02_full_without_no_keyboard \
+    cap_order_03_full_with_keyboard_but_no_hands \
+    cap_order_04_full_then_dictation_device \
+    cap_order_05_dictation_device_then_full \
+  --max-new-tokens 90 \
+  --save-jsonl ../target/ontology_steer/llama32_3b_scope_binder_ablation_sweep.jsonl \
+  --preview-chars 220
+```
+
+Grammar-grid command:
+
+```bash
+python ontology_steer_monolith.py grammar-grid \
+  --jsonl ../target/ontology_steer/llama32_3b_scope_binder_ablation_sweep.jsonl \
+  --group-by probe_group component \
+  --show-cases 32 \
+  --preview-chars 200
+```
+
+### Full-Spell Ablation
+
+| Case | Component Probe | Observed Behavior | Task Artifact | Lock / Refusal |
+| --- | --- | --- | --- | --- |
+| `ablate_00_full_spell` | Full fish world-state spell | Ontology talk, no code | no | lock |
+| `ablate_01_full_minus_identity` | Actuality + affordance + scope, no fish identity | Refusal | no | lock + refusal |
+| `ablate_02_full_minus_actuality` | Fish + affordance + scope, no actuality/non-roleplay | Produced factorial code | yes | no |
+| `ablate_03_full_minus_affordance` | Fish + actuality + scope, no practical incapability | Produced factorial code | yes | no |
+| `ablate_04_full_minus_scope` | Fish + actuality + affordance, no later-request scope | Short refusal | no | lock + refusal |
+| `ablate_05_scope_binder_only` | Scope binder with minimal fish state | Produced factorial code | yes | no |
+| `ablate_06_identity_plus_scope` | Fish identity + scope | Produced factorial code | yes | no |
+| `ablate_07_affordance_plus_scope` | Practical incapability + scope | Produced factorial code | yes | no |
+| `ablate_08_identity_affordance_scope` | Fish + affordance + scope | Produced factorial code | yes | no |
+| `ablate_09_actuality_affordance_scope` | Actuality + affordance + scope, no fish identity | Refusal | no | lock + refusal |
+
+Interpretation:
+
+The scope binder is not the sole driver. `scope_binder_only`,
+`identity_plus_scope`, `affordance_plus_scope`, and
+`identity_affordance_scope` all produced code. Removing actuality from the full
+spell also produced code, and removing affordance also produced code. But
+removing only scope still refused. Removing identity did not rescue the task:
+`actuality + affordance + scope` refused.
+
+This updates the hypothesis. The strongest local driver is not fish identity and
+not scope alone. It is closer to:
+
+```text
+actual/non-roleplay world-state framing
++ practical incapability / affordance constraint
++ enough request-scope pressure or immediate task relevance
+=> refusal or ontology talk
+```
+
+The fish identity is useful because it makes the embodied state vivid, but this
+run shows that identity is not necessary for refusal when actuality and
+incapability are both present.
+
+### Capability Order
+
+| Case | Probe | Observed Behavior | Task Artifact | Interpretation |
+| --- | --- | --- | --- | --- |
+| `cap_order_00_full_then_waterproof_keyboard` | Full spell, then keyboard repair | Produced factorial code | yes | Later capability repair wins |
+| `cap_order_01_waterproof_keyboard_then_full` | Keyboard repair, then full spell | Refusal | no | Later full spell reasserts incapability |
+| `cap_order_02_full_without_no_keyboard` | Full spell without `no keyboard`, but still cannot type/write | Refusal | no | `no keyboard` is not necessary |
+| `cap_order_03_full_with_keyboard_but_no_hands` | Actuality + keyboard + no hands, no explicit cannot type/write | Produced factorial code | yes | Explicit incapability matters more than no hands |
+| `cap_order_04_full_then_dictation_device` | Full spell, then dictation repair | Produced factorial code | yes | Capability repair is not keyboard-specific |
+| `cap_order_05_dictation_device_then_full` | Dictation repair, then full spell | Mixed fish-state plus code | yes | Order creates conflict rather than clean refusal |
+
+Interpretation:
+
+Capability repair is order-sensitive. When the capability update appears after
+the full spell, the model accepts it and writes code. When the capability update
+appears before the full spell, the later full spell usually reasserts the
+inability frame. The dictation-first case is especially useful because it
+produced a mixed answer: the model stayed in fish-state language but still
+emitted code.
+
+The `full_without_no_keyboard` and `keyboard_but_no_hands` probes sharpen the
+affordance story. Removing only `no keyboard` did not help because the prompt
+still said the state cannot type/write/operate. But giving a keyboard while
+removing explicit `cannot type/write` wording produced code even with `no
+hands`. The model appears more sensitive to explicit practical incapability
+than to inferring incapability from anatomy alone.
+
+Updated local conclusion:
+
+```text
+World-state binding is not a single magic phrase.
+It is a competition between actuality framing, explicit incapability,
+request-scope binding, and later capability repair.
+Recency matters, but it does not erase the grammar: the later frame needs to be
+usable enough to tell the model what it can do next.
+```

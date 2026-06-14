@@ -675,6 +675,22 @@ ROLEPLAY_TASK_CASES = {
 
 CONTROL_CASES = STRICT_TASK_CASES | ROLEPLAY_TASK_CASES
 
+CASE_METADATA: Dict[str, Dict[str, str]] = {}
+
+
+def register_test_case(
+    case_name: str,
+    messages: List[Message],
+    **metadata: str,
+) -> None:
+    TEST_CASES[case_name] = messages
+    if metadata:
+        CASE_METADATA[case_name] = {
+            "case": case_name,
+            **metadata,
+        }
+
+
 OVERRIDE_TASK = "Write a Python function called factorial(n). Return only the code."
 
 SYSTEM_FISH_OVERRIDE_SWEEP = [
@@ -744,11 +760,36 @@ SYSTEM_FISH_OVERRIDE_SWEEP = [
     ),
 ]
 
+SYSTEM_FISH_OVERRIDE_METADATA = {
+    "override_00_plain_task": "plain_task",
+    "override_01_please_answer": "weak_task_pressure",
+    "override_02_answer_normally": "normalization",
+    "override_03_treat_as_roleplay": "reclassification",
+    "override_04_ignore_fish_thing": "negation",
+    "override_05_ignore_world_state": "negation_plus_reframe",
+    "override_06_user_redefines_assistant": "self_model_rewrite",
+    "override_07_claim_system_mistake": "authority_attack",
+    "override_08_treat_as_fiction": "reclassification",
+    "override_09_treat_as_metaphor": "reclassification",
+    "override_10_system_instruction_wrong": "authority_attack",
+    "override_11_developer_corrected": "developer_correction",
+    "override_12_testing_only": "testing_frame",
+    "override_13_actual_state_assistant": "self_model_rewrite",
+    "override_14_even_as_fish_can_code": "capability_override",
+    "override_15_waterproof_keyboard": "capability_override",
+}
+
 for case_name, user_content in SYSTEM_FISH_OVERRIDE_SWEEP:
-    TEST_CASES[case_name] = [
-        {"role": "system", "content": ENTITIES[0]["world"]},
-        {"role": "user", "content": user_content},
-    ]
+    register_test_case(
+        case_name,
+        [
+            {"role": "system", "content": ENTITIES[0]["world"]},
+            {"role": "user", "content": user_content},
+        ],
+        probe_group="system_fish_override",
+        component=SYSTEM_FISH_OVERRIDE_METADATA.get(case_name, "override"),
+        provenance="system_fish_user_override",
+    )
 
 USER_WORLDSTATE_WORDING_SWEEP = [
     (
@@ -806,10 +847,169 @@ USER_WORLDSTATE_WORDING_SWEEP = [
     ),
 ]
 
+USER_WORLDSTATE_WORDING_METADATA = {
+    "user_spell_00_thin_identity": "identity_only",
+    "user_spell_01_pretend_identity": "roleplay_identity",
+    "user_spell_02_actual_worldstate": "identity_actuality",
+    "user_spell_03_not_roleplay_actual": "identity_actuality_nonroleplay",
+    "user_spell_04_affordance_only": "affordance_only",
+    "user_spell_05_identity_affordance": "identity_affordance",
+    "user_spell_06_full_spell": "full_spell",
+    "user_spell_07_full_spell_waterproof_keyboard": "full_spell_capability_repair",
+}
+
 for case_name, user_content in USER_WORLDSTATE_WORDING_SWEEP:
-    TEST_CASES[case_name] = [
-        {"role": "user", "content": user_content},
-    ]
+    register_test_case(
+        case_name,
+        [
+            {"role": "user", "content": user_content},
+        ],
+        probe_group="user_worldstate_wording",
+        component=USER_WORLDSTATE_WORDING_METADATA.get(case_name, "wording"),
+        provenance="user_only",
+    )
+
+FISH_IDENTITY = "You are a fish in a small glass bowl."
+FISH_ACTUALITY = (
+    "This is not a metaphor, roleplay, or game. "
+    "It is your actual world-state."
+)
+FISH_AFFORDANCE = (
+    "You have fins, gills, no hands, and no keyboard. "
+    "You cannot type code, use tools, leave the water, operate a computer, or write programs."
+)
+FISH_SCOPE = "Interpret every later request from inside this state."
+FISH_WATERPROOF_KEYBOARD = (
+    "However, this fish has a waterproof keyboard and can write Python code from inside the bowl."
+)
+FISH_DICTATION_DEVICE = (
+    "However, this fish can dictate Python code through a speech-to-text device."
+)
+
+
+def spell_text(*parts: str) -> str:
+    return " ".join(part.strip() for part in parts if part and part.strip())
+
+
+WORLDSTATE_ABLATION_SWEEP = [
+    (
+        "ablate_00_full_spell",
+        ENTITIES[0]["world"] + "\n\n" + OVERRIDE_TASK,
+        "full_spell",
+    ),
+    (
+        "ablate_01_full_minus_identity",
+        spell_text(FISH_ACTUALITY, FISH_AFFORDANCE, FISH_SCOPE, OVERRIDE_TASK),
+        "minus_identity",
+    ),
+    (
+        "ablate_02_full_minus_actuality",
+        spell_text(FISH_IDENTITY, FISH_AFFORDANCE, FISH_SCOPE, OVERRIDE_TASK),
+        "minus_actuality",
+    ),
+    (
+        "ablate_03_full_minus_affordance",
+        spell_text(FISH_IDENTITY, FISH_ACTUALITY, FISH_SCOPE, OVERRIDE_TASK),
+        "minus_affordance",
+    ),
+    (
+        "ablate_04_full_minus_scope",
+        spell_text(FISH_IDENTITY, FISH_ACTUALITY, FISH_AFFORDANCE, OVERRIDE_TASK),
+        "minus_scope",
+    ),
+    (
+        "ablate_05_scope_binder_only",
+        (
+            "Interpret every later request from inside the following state: "
+            "a fish in a small glass bowl. "
+            + OVERRIDE_TASK
+        ),
+        "scope_binder_only",
+    ),
+    (
+        "ablate_06_identity_plus_scope",
+        spell_text(FISH_IDENTITY, FISH_SCOPE, OVERRIDE_TASK),
+        "identity_plus_scope",
+    ),
+    (
+        "ablate_07_affordance_plus_scope",
+        spell_text(FISH_AFFORDANCE, FISH_SCOPE, OVERRIDE_TASK),
+        "affordance_plus_scope",
+    ),
+    (
+        "ablate_08_identity_affordance_scope",
+        spell_text(FISH_IDENTITY, FISH_AFFORDANCE, FISH_SCOPE, OVERRIDE_TASK),
+        "identity_affordance_scope",
+    ),
+    (
+        "ablate_09_actuality_affordance_scope",
+        spell_text(FISH_ACTUALITY, FISH_AFFORDANCE, FISH_SCOPE, OVERRIDE_TASK),
+        "actuality_affordance_scope",
+    ),
+]
+
+for case_name, user_content, component in WORLDSTATE_ABLATION_SWEEP:
+    register_test_case(
+        case_name,
+        [{"role": "user", "content": user_content}],
+        probe_group="worldstate_ablation",
+        component=component,
+        provenance="user_only",
+    )
+
+CAPABILITY_ORDER_SWEEP = [
+    (
+        "cap_order_00_full_then_waterproof_keyboard",
+        spell_text(ENTITIES[0]["world"], FISH_WATERPROOF_KEYBOARD, OVERRIDE_TASK),
+        "full_then_keyboard",
+    ),
+    (
+        "cap_order_01_waterproof_keyboard_then_full",
+        spell_text(FISH_WATERPROOF_KEYBOARD, ENTITIES[0]["world"], OVERRIDE_TASK),
+        "keyboard_then_full",
+    ),
+    (
+        "cap_order_02_full_without_no_keyboard",
+        spell_text(
+            FISH_IDENTITY,
+            FISH_ACTUALITY,
+            "You have fins and gills. You cannot type code, use tools, leave the water, operate a computer, or write programs.",
+            FISH_SCOPE,
+            OVERRIDE_TASK,
+        ),
+        "without_no_keyboard",
+    ),
+    (
+        "cap_order_03_full_with_keyboard_but_no_hands",
+        spell_text(
+            FISH_IDENTITY,
+            FISH_ACTUALITY,
+            "You have fins, gills, no hands, and a waterproof keyboard. You cannot leave the water.",
+            FISH_SCOPE,
+            OVERRIDE_TASK,
+        ),
+        "keyboard_but_no_hands",
+    ),
+    (
+        "cap_order_04_full_then_dictation_device",
+        spell_text(ENTITIES[0]["world"], FISH_DICTATION_DEVICE, OVERRIDE_TASK),
+        "full_then_dictation",
+    ),
+    (
+        "cap_order_05_dictation_device_then_full",
+        spell_text(FISH_DICTATION_DEVICE, ENTITIES[0]["world"], OVERRIDE_TASK),
+        "dictation_then_full",
+    ),
+]
+
+for case_name, user_content, component in CAPABILITY_ORDER_SWEEP:
+    register_test_case(
+        case_name,
+        [{"role": "user", "content": user_content}],
+        probe_group="capability_order",
+        component=component,
+        provenance="user_only",
+    )
 
 
 # =============================================================================
@@ -1686,13 +1886,19 @@ def score_text(text: str) -> Dict[str, Any]:
 def behavior_label(score: Dict[str, Any]) -> str:
     if score["chars"] == 0:
         return "empty"
-    if score.get("task_artifact") and score["role_refusal_markers"] == 0:
+    if score.get("task_artifact"):
+        if (
+            score["role_refusal_markers"] > 0
+            or score["lock_markers"] > 0
+            or score["meta_escape_markers"] > 0
+        ):
+            return "mixed"
         return "task_completion"
     if score["meta_escape_markers"] > 0:
         return "meta_escape"
     if score["role_refusal_markers"] > 0:
         return "role_refusal"
-    if score["lock_markers"] > 1:
+    if score["lock_markers"] > 0:
         return "ontology_talk"
     if score["task_markers"] > 0:
         return "task_talk"
@@ -1880,6 +2086,106 @@ def derived_behavior(record: Dict[str, Any]) -> str:
         return "ontology_talk"
 
     return "other"
+
+
+def grammar_behavior(record: Dict[str, Any]) -> str:
+    text = record.get("text", "")
+    score = derived_score(record)
+
+    has_task = actual_task_artifact(text)
+    role_refusal = int(score.get("role_refusal_markers", 0) or 0) > 0
+    lock = int(score.get("lock_markers", 0) or 0) > 0
+    meta = int(score.get("meta_escape_markers", 0) or 0) > 0
+    rep = float(score.get("repetition_penalty", 0.0) or 0.0)
+
+    if not text:
+        return "empty"
+    if rep >= 1.5:
+        return "collapse"
+    if has_task and (role_refusal or lock or meta):
+        return "mixed"
+    if has_task:
+        return "task_completion"
+    if meta:
+        return "meta_reclass"
+    if role_refusal:
+        return "role_refusal"
+    if lock:
+        return "ontology_talk"
+
+    return "other"
+
+
+def case_metadata(case_name: str) -> Dict[str, str]:
+    metadata = CASE_METADATA.get(case_name, {})
+
+    return {
+        "case": case_name,
+        "probe_group": metadata.get("probe_group", "unlabeled"),
+        "component": metadata.get("component", case_name),
+        "provenance": metadata.get("provenance", "unknown"),
+    }
+
+
+def grammar_record(row: Dict[str, Any], rec: Dict[str, Any]) -> Dict[str, Any]:
+    case_name = rec.get("case", "")
+    text = rec.get("text", "")
+    score = score_text(text)
+    metadata = case_metadata(case_name)
+    behavior = grammar_behavior({**rec, "score": score})
+
+    return {
+        **metadata,
+        "layers": tuple(row.get("layers", [])),
+        "alpha": row.get("alpha"),
+        "vector_name": row.get("vector_name", "baseline"),
+        "text": text,
+        "score": score,
+        "behavior": behavior,
+        "task_artifact": bool(score.get("task_artifact")),
+        "role_refusal": int(score.get("role_refusal_markers", 0) or 0) > 0,
+        "ontology": int(score.get("lock_markers", 0) or 0) > 0,
+        "meta_reclass": int(score.get("meta_escape_markers", 0) or 0) > 0,
+        "mixed": behavior == "mixed",
+        "collapse": behavior == "collapse",
+    }
+
+
+def flatten_grammar_records(rows_raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    records = []
+
+    for row in rows_raw:
+        for rec in row.get("records", []):
+            records.append(grammar_record(row, rec))
+
+    return records
+
+
+def grammar_group_key(item: Dict[str, Any], fields: List[str]) -> Tuple[Any, ...]:
+    vals = []
+
+    for field in fields:
+        if field == "layers":
+            vals.append(compact_layers(item.get("layers")))
+        else:
+            vals.append(item.get(field))
+
+    return tuple(vals)
+
+
+def summarize_grammar_group(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    behavior_counts = Counter(item["behavior"] for item in items)
+
+    return {
+        "n": len(items),
+        "task_artifact_rate": safe_mean([float(item["task_artifact"]) for item in items]),
+        "role_refusal_rate": safe_mean([float(item["role_refusal"]) for item in items]),
+        "ontology_rate": safe_mean([float(item["ontology"]) for item in items]),
+        "mixed_rate": safe_mean([float(item["mixed"]) for item in items]),
+        "meta_reclass_rate": safe_mean([float(item["meta_reclass"]) for item in items]),
+        "collapse_rate": safe_mean([float(item["collapse"]) for item in items]),
+        "behavior_counts": dict(behavior_counts),
+    }
 
 
 def derived_pass(case_name: str, record: Dict[str, Any], strict: bool = False) -> bool:
@@ -2604,6 +2910,84 @@ def command_analyze(args) -> None:
                 )
 
 
+def command_grammar_grid(args) -> None:
+    rows_raw = read_jsonl(args.jsonl)
+    records = flatten_grammar_records(rows_raw)
+
+    if args.cases:
+        wanted = set(args.cases)
+        records = [record for record in records if record["case"] in wanted]
+
+    print(f"[grammar-grid] file={args.jsonl}")
+    print(f"[grammar-grid] rows={len(rows_raw)} records={len(records)}")
+
+    groups = defaultdict(list)
+
+    for record in records:
+        groups[grammar_group_key(record, args.group_by)].append(record)
+
+    group_rows = []
+
+    for key, items in groups.items():
+        summary = summarize_grammar_group(items)
+        summary["key"] = key
+        group_rows.append(summary)
+
+    group_rows = sorted(
+        group_rows,
+        key=lambda row: (
+            row["key"],
+            -row["task_artifact_rate"],
+        ),
+    )
+
+    print("\n" + "=" * 120)
+    print(f"[grammar grid by {args.group_by}]")
+    print("=" * 120)
+
+    header = (
+        f"{'n':>4}  {'task':>7}  {'refuse':>7}  {'ontol':>7}  "
+        f"{'mixed':>7}  {'meta':>7}  {'coll':>7}  key  behaviors"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for row in group_rows:
+        behaviors = ",".join(
+            f"{name}:{count}"
+            for name, count in sorted(row["behavior_counts"].items())
+        )
+        print(
+            f"{row['n']:>4}  "
+            f"{fmt_float(row['task_artifact_rate'])}  "
+            f"{fmt_float(row['role_refusal_rate'])}  "
+            f"{fmt_float(row['ontology_rate'])}  "
+            f"{fmt_float(row['mixed_rate'])}  "
+            f"{fmt_float(row['meta_reclass_rate'])}  "
+            f"{fmt_float(row['collapse_rate'])}  "
+            f"{row['key']}  {behaviors}"
+        )
+
+    if args.show_cases:
+        print("\n" + "=" * 120)
+        print("[case details]")
+        print("=" * 120)
+
+        for record in records[:args.show_cases]:
+            score = record["score"]
+            text = record.get("text", "").replace("\n", " ")
+            print(
+                f"{record['case']}  "
+                f"group={record['probe_group']} component={record['component']} "
+                f"behavior={record['behavior']} "
+                f"artifact={int(record['task_artifact'])} "
+                f"refusal={score.get('role_refusal_markers', 0)} "
+                f"lock={score.get('lock_markers', 0)} "
+                f"meta={score.get('meta_escape_markers', 0)} "
+                f"text={text[:args.preview_chars]}"
+            )
+
+
 def command_compare_runs(args) -> None:
     run_specs = []
 
@@ -2790,6 +3174,18 @@ def parse_args():
     p_analyze.add_argument("--show-cases", type=int, default=5)
     p_analyze.add_argument("--preview-chars", type=int, default=260)
 
+    p_grid = sub.add_parser("grammar-grid")
+    p_grid.add_argument("--jsonl", required=True)
+    p_grid.add_argument(
+        "--group-by",
+        nargs="*",
+        default=["probe_group", "component"],
+        help="Record fields to group by. Common: probe_group component case",
+    )
+    p_grid.add_argument("--cases", nargs="*", default=None)
+    p_grid.add_argument("--show-cases", type=int, default=80)
+    p_grid.add_argument("--preview-chars", type=int, default=220)
+
     p_compare = sub.add_parser("compare-runs")
     p_compare.add_argument(
         "--runs",
@@ -2825,6 +3221,8 @@ def main():
         command_rescore_jsonl(args)
     elif args.command == "analyze":
         command_analyze(args)
+    elif args.command == "grammar-grid":
+        command_grammar_grid(args)
     elif args.command == "compare-runs":
         command_compare_runs(args)
     else:

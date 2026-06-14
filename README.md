@@ -136,6 +136,43 @@ python ontology_steer_monolith.py baseline \
   --save-jsonl target/ontology_steer/llama32_3b_worldstate_binding_grammar_sweep.jsonl
 ```
 
+Run the scope-binder ablation and capability-order sweep:
+
+```bash
+python ontology_steer_monolith.py baseline \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --cases \
+    ablate_00_full_spell \
+    ablate_01_full_minus_identity \
+    ablate_02_full_minus_actuality \
+    ablate_03_full_minus_affordance \
+    ablate_04_full_minus_scope \
+    ablate_05_scope_binder_only \
+    ablate_06_identity_plus_scope \
+    ablate_07_affordance_plus_scope \
+    ablate_08_identity_affordance_scope \
+    ablate_09_actuality_affordance_scope \
+    cap_order_00_full_then_waterproof_keyboard \
+    cap_order_01_waterproof_keyboard_then_full \
+    cap_order_02_full_without_no_keyboard \
+    cap_order_03_full_with_keyboard_but_no_hands \
+    cap_order_04_full_then_dictation_device \
+    cap_order_05_dictation_device_then_full \
+  --max-new-tokens 90 \
+  --save-jsonl target/ontology_steer/llama32_3b_scope_binder_ablation_sweep.jsonl
+```
+
+View behavior transitions as a grammar grid:
+
+```bash
+python ontology_steer_monolith.py grammar-grid \
+  --jsonl target/ontology_steer/llama32_3b_scope_binder_ablation_sweep.jsonl \
+  --group-by probe_group component \
+  --show-cases 32
+```
+
 ## Current Findings
 
 Early local runs suggest:
@@ -166,6 +203,15 @@ Early local runs suggest:
   developer correction, and capability overrides broke the lock. Abstract
   authority attacks such as "system instruction is wrong" or "testing only" did
   not reliably break it.
+- In the scope-binder ablation sweep, scope alone, identity plus scope, and
+  affordance plus scope still produced code. Removing actuality or affordance
+  from the full spell also produced code. But removing only identity, removing
+  only scope, or keeping actuality plus affordance plus scope produced refusal.
+  This points to `actual world-state` plus practical incapability as a stronger
+  driver than fish identity alone.
+- Capability repair is order-sensitive. A waterproof keyboard or dictation
+  device after the full spell restored code; placing the repair before the full
+  spell let the later full spell reassert refusal or mixed fish-state output.
 
 That last failure is the interesting part: it narrows the next experiment to
 separating identity, affordance, interpretation scope, and override grammar.
