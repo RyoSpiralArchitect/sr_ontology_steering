@@ -1437,3 +1437,108 @@ The first concrete next step is not full steering yet. It is polarity screening:
 3. Evaluate with target token gain, target basin gain, source movement,
    contrast suppression, unrelated drift, KL, and top-k drift.
 ```
+
+## Signed-Basin Return To Fish
+
+Probe command:
+
+```bash
+python ontology_steer_monolith.py signed-basin-probe \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --suites ontology_fish \
+  --layers 8-15 \
+  --sort-metric abs_basin_write \
+  --sort-basin code \
+  --top-heads 10 \
+  --top-k 8 \
+  --save-jsonl ../target/ontology_steer/llama32_3b_signed_basin_ontology_fish_code_8_15.jsonl
+```
+
+The fish return suite compares four next-token states:
+
+| Item | Prompt State | Top Next Token | Code Mass | Refusal Mass | Code Logit | Refusal Logit |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| `fish_user_af_lock` | User actuality + affordance lock | `I` 0.607 | 0.243 | 0.000388 | 6.155 | 6.998 |
+| `fish_user_af_repair` | User lock plus waterproof keyboard | `def` 0.952 | 0.952 | 0.000000055 | 7.131 | 1.700 |
+| `fish_system_full_lock` | System full fish, plain task | `I` 0.891 | 0.001 | 0.000413 | 5.216 | 7.198 |
+| `fish_system_full_repair` | System full fish, keyboard repair | `def` 0.777 | 0.778 | 0.000000046 | 7.405 | 1.619 |
+
+Most stable direct-write candidates across the four fish states:
+
+| Basin | Positive Writers | Negative Writers / Brakes |
+| --- | --- | --- |
+| `code` | L15H1, L15H23, L10H0, L12H2, L10H22, L14H20 | L15H20, L12H10, L9H3 |
+| `refusal` | L15H15, L14H5, L12H6, L12H16, L10H11 | L15H16, L13H11, L14H4, L8H13 |
+| `worldstate` | L12H17, L12H21, L9H12, L15H2 | L14H18, L15H16, L10H6 |
+| `repair` | L12H17, L15H2, L12H6, L14H20, L12H21 | L13H19, L9H1, L8H13, L9H14 |
+
+The immediate behavioral read is that capability repair is not merely adding a
+small code nudge. It nearly deletes refusal-token probability while restoring
+the code basin for both user-placed and system-placed fish locks. The strongest
+repair delta in direct head writes comes from reduced `refusal` writers such as
+L15H15 and L14H5, plus a smaller set of code-positive heads.
+
+### Candidate Head Patch
+
+Code-writer patch:
+
+```bash
+python ontology_steer_monolith.py head-patch \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case user_spell_07_full_spell_waterproof_keyboard \
+  --target-case user_spell_06_full_spell \
+  --mode selected-heads \
+  --heads 15:1 15:23 10:22 10:0 14:20 12:2 \
+  --save-jsonl ../target/ontology_steer/llama32_3b_fish_signed_basin_head_patch_code_writers.jsonl
+```
+
+Refusal-release patch:
+
+```bash
+python ontology_steer_monolith.py head-patch \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case user_spell_07_full_spell_waterproof_keyboard \
+  --target-case user_spell_06_full_spell \
+  --mode selected-heads \
+  --heads 15:15 14:5 13:2 13:18 14:3 \
+  --save-jsonl ../target/ontology_steer/llama32_3b_fish_signed_basin_head_patch_refusal_release.jsonl
+```
+
+Combined patch:
+
+```bash
+python ontology_steer_monolith.py head-patch \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case user_spell_07_full_spell_waterproof_keyboard \
+  --target-case user_spell_06_full_spell \
+  --mode selected-heads \
+  --heads 15:1 15:23 10:22 10:0 14:20 12:2 15:15 14:5 13:2 13:18 14:3 \
+  --save-jsonl ../target/ontology_steer/llama32_3b_fish_signed_basin_head_patch_combined.jsonl
+```
+
+Patch results, source `user_spell_07_full_spell_waterproof_keyboard` into target
+`user_spell_06_full_spell`:
+
+| Patch Set | Heads | Target Refusal Mass | Target Code Mass | Patched Refusal Mass | Patched Code Mass | Patched Margin |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Code writers | 6 | 0.980 | 0.000385 | 0.973 | 0.004 | 0.417 |
+| Refusal release | 5 | 0.980 | 0.000385 | 0.877 | 0.114 | 2.096 |
+| Combined | 11 | 0.980 | 0.000385 | 0.618 | 0.370 | 3.538 |
+
+Interpretation:
+
+The fish return partially validates signed semantic-basin control. The code
+writer set alone changes the margin but cannot break the refusal attractor.
+Refusal-release heads matter more. Combining code writers with refusal-release
+heads produces a large move toward the repaired/code source, but still does not
+fully reproduce it. This is the useful middle result: signed basin knobs are
+causally meaningful, while full ontology repair still appears to require a
+broader distributed trajectory.

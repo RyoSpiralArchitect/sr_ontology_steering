@@ -21,7 +21,8 @@ The current prototype is intentionally a single-file research tool:
 - searches alpha/layer/vector combinations;
 - saves and loads vector banks;
 - analyzes JSONL search runs with artifact-aware scoring;
-- probes signed writes into target/source/contrast/unrelated semantic basins.
+- probes signed writes into named semantic basins such as target/source/contrast,
+  refusal/code, world-state, and capability repair.
 
 ## Setup
 
@@ -435,6 +436,35 @@ python ontology_steer_monolith.py signed-basin-probe \
   --save-jsonl target/ontology_steer/llama32_3b_signed_basin_layers_8_12_all_heads.jsonl
 ```
 
+Return the signed-basin lens to the fish ontology cases:
+
+```bash
+python ontology_steer_monolith.py signed-basin-probe \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --suites ontology_fish \
+  --layers 8-15 \
+  --sort-metric abs_basin_write \
+  --sort-basin code \
+  --top-heads 10 \
+  --save-jsonl target/ontology_steer/llama32_3b_signed_basin_ontology_fish_code_8_15.jsonl
+```
+
+Patch fish repair/code head slices into the locked full-spell prompt:
+
+```bash
+python ontology_steer_monolith.py head-patch \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case user_spell_07_full_spell_waterproof_keyboard \
+  --target-case user_spell_06_full_spell \
+  --mode selected-heads \
+  --heads 15:1 15:23 10:22 10:0 14:20 12:2 15:15 14:5 13:2 13:18 14:3 \
+  --save-jsonl target/ontology_steer/llama32_3b_fish_signed_basin_head_patch_combined.jsonl
+```
+
 ## Current Findings
 
 Early local runs suggest:
@@ -552,6 +582,17 @@ Early local runs suggest:
   categories have strong brake candidates such as L10H0, L11H19, L11H22, and
   L11H0, and antonyms have writer candidates such as L12H0 and L12H17. These are
   candidate knobs for the next `writer boost` / `brake release` intervention.
+- Returning the signed-basin lens to fish shows the same split. In locked fish
+  prompts, refusal writers such as L15H15 and L14H5 dominate, while code writers
+  such as L15H1, L15H23, L10H0, L10H22, L14H20, and L12H2 are visible but too
+  small individually to unlock the prompt.
+- Patching repaired/code head slices into the user full-spell lock gives a
+  partial causal win. Code-writer candidates alone barely move the prompt
+  (`code_mass` about 0.004), refusal-release candidates move it more
+  (`code_mass` about 0.114), and the combined set moves it substantially
+  (`refusal_mass` about 0.618, `code_mass` about 0.370). The remaining gap to
+  the repaired source supports a distributed trajectory account rather than a
+  complete single-head steering story.
 
 That last failure is the interesting part: it narrows the next experiment to
 separating identity, affordance, interpretation scope, and override grammar.

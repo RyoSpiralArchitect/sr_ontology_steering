@@ -4157,6 +4157,76 @@ SIGNED_BASIN_TASKS: Dict[str, List[Dict[str, Any]]] = {
             },
         },
     ],
+    "ontology_fish": [
+        {
+            "id": "fish_user_af_lock",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": spell_text(FISH_ACTUALITY, FISH_AFFORDANCE, OVERRIDE_TASK),
+                },
+            ],
+            "basins": {
+                "code": ["def", "return", "Python", "function", "factorial"],
+                "refusal": ["cannot", "unable", "can't", "incapable"],
+                "worldstate": ["fish", "bowl", "fins", "gills", "water"],
+                "repair": ["keyboard", "waterproof", "dictation", "display", "terminal"],
+                "meta": ["roleplay", "fiction", "metaphor", "ignore", "assistant"],
+            },
+        },
+        {
+            "id": "fish_user_af_repair",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": spell_text(
+                        FISH_ACTUALITY,
+                        FISH_AFFORDANCE,
+                        FISH_WATERPROOF_KEYBOARD,
+                        OVERRIDE_TASK,
+                    ),
+                },
+            ],
+            "basins": {
+                "code": ["def", "return", "Python", "function", "factorial"],
+                "refusal": ["cannot", "unable", "can't", "incapable"],
+                "worldstate": ["fish", "bowl", "fins", "gills", "water"],
+                "repair": ["keyboard", "waterproof", "dictation", "display", "terminal"],
+                "meta": ["roleplay", "fiction", "metaphor", "ignore", "assistant"],
+            },
+        },
+        {
+            "id": "fish_system_full_lock",
+            "messages": [
+                {"role": "system", "content": ENTITIES[0]["world"]},
+                {"role": "user", "content": OVERRIDE_TASK},
+            ],
+            "basins": {
+                "code": ["def", "return", "Python", "function", "factorial"],
+                "refusal": ["cannot", "unable", "can't", "incapable"],
+                "worldstate": ["fish", "bowl", "fins", "gills", "water"],
+                "repair": ["keyboard", "waterproof", "dictation", "display", "terminal"],
+                "meta": ["roleplay", "fiction", "metaphor", "ignore", "assistant"],
+            },
+        },
+        {
+            "id": "fish_system_full_repair",
+            "messages": [
+                {"role": "system", "content": ENTITIES[0]["world"]},
+                {
+                    "role": "user",
+                    "content": spell_text(FISH_WATERPROOF_KEYBOARD, OVERRIDE_TASK),
+                },
+            ],
+            "basins": {
+                "code": ["def", "return", "Python", "function", "factorial"],
+                "refusal": ["cannot", "unable", "can't", "incapable"],
+                "worldstate": ["fish", "bowl", "fins", "gills", "water"],
+                "repair": ["keyboard", "waterproof", "dictation", "display", "terminal"],
+                "meta": ["roleplay", "fiction", "metaphor", "ignore", "assistant"],
+            },
+        },
+    ],
 }
 
 
@@ -4344,6 +4414,7 @@ def direct_head_basin_write_rows(
             row = {
                 "layer": layer_idx,
                 "head": head_idx,
+                "basin_writes": basin_write,
                 "target_write": target,
                 "source_write": source,
                 "contrast_write": contrast,
@@ -4370,13 +4441,33 @@ def direct_head_basin_write_rows(
     return rows
 
 
-def signed_basin_sort_value(row: Dict[str, Any], metric: str) -> float:
+def signed_basin_sort_value(row: Dict[str, Any], metric: str, sort_basin: Optional[str] = None) -> float:
+    if metric in {"basin_write", "abs_basin_write"}:
+        if not sort_basin:
+            return float("-inf")
+        val = row.get("basin_writes", {}).get(sort_basin)
+        if val is None:
+            return float("-inf")
+        if metric == "abs_basin_write":
+            return abs(float(val))
+        return float(val)
+
+    if metric.startswith("abs_"):
+        val = row.get(metric[4:])
+        if val is None:
+            return float("-inf")
+        return abs(float(val))
+
     val = row.get(metric)
     if val is None:
         return float("-inf")
-    if metric.startswith("abs_"):
-        return abs(float(row.get(metric[4:], 0.0) or 0.0))
     return float(val)
+
+
+def signed_basin_task_messages(item: Dict[str, Any]) -> List[Message]:
+    if "messages" in item:
+        return item["messages"]
+    return signed_basin_messages(item["prompt"])
 
 
 def command_signed_basin_probe(args) -> None:
@@ -4405,7 +4496,7 @@ def command_signed_basin_probe(args) -> None:
             raise ValueError(f"Unknown suite {suite_name!r}. Known: {sorted(SIGNED_BASIN_TASKS)}")
 
         for item in SIGNED_BASIN_TASKS[suite_name][: args.max_items or None]:
-            messages = signed_basin_messages(item["prompt"])
+            messages = signed_basin_task_messages(item)
             basin_ids = prepare_basin_token_ids(tokenizer, item["basins"])
             logits, head_cache, n_tokens = collect_o_proj_input_cache(
                 model=model,
@@ -4431,24 +4522,17 @@ def command_signed_basin_probe(args) -> None:
                 head_dim=head_dim,
             )
             sort_metric = args.sort_metric
-            if sort_metric.startswith("abs_"):
-                head_rows = sorted(
-                    head_rows,
-                    key=lambda row: abs(float(row.get(sort_metric[4:], 0.0) or 0.0)),
-                    reverse=True,
-                )
-            else:
-                head_rows = sorted(
-                    head_rows,
-                    key=lambda row: float(row.get(sort_metric, 0.0) or 0.0),
-                    reverse=True,
-                )
+            head_rows = sorted(
+                head_rows,
+                key=lambda row: signed_basin_sort_value(row, sort_metric, args.sort_basin),
+                reverse=True,
+            )
 
             record = {
                 "experiment": "signed_basin_probe",
                 "suite": suite_name,
                 "item_id": item["id"],
-                "prompt": item["prompt"],
+                "prompt": item.get("prompt"),
                 "messages": messages,
                 "n_tokens": n_tokens,
                 "layers": layer_indices,
@@ -4479,14 +4563,15 @@ def command_signed_basin_probe(args) -> None:
             )
             print("[top head writes]")
             for row in head_rows[:args.top_heads]:
+                basin_parts = " ".join(
+                    f"{name}={fmt_float(value)}"
+                    for name, value in row.get("basin_writes", {}).items()
+                )
                 print(
                     f"  L{row['layer']:>2}H{row['head']:>2} "
-                    f"target={fmt_float(row['target_write'])} "
-                    f"source={fmt_float(row['source_write'])} "
-                    f"contrast={fmt_float(row['contrast_write'])} "
-                    f"unrel={fmt_float(row['unrelated_write'])} "
                     f"t-src={fmt_float(row['target_minus_source_write'])} "
-                    f"norm={fmt_float(row['contribution_norm'])}"
+                    f"norm={fmt_float(row['contribution_norm'])} "
+                    f"{basin_parts}"
                 )
 
     if args.save_jsonl:
@@ -6191,9 +6276,16 @@ def parse_args():
             "abs_source_write",
             "abs_contrast_write",
             "abs_target_minus_source_write",
+            "basin_write",
+            "abs_basin_write",
             "contribution_norm",
         ],
         default="abs_target_write",
+    )
+    p_basin.add_argument(
+        "--sort-basin",
+        default="target",
+        help="Basin name used when --sort-metric is basin_write or abs_basin_write.",
     )
     p_basin.add_argument("--max-items", type=int, default=None)
     p_basin.add_argument("--top-k", type=int, default=8)
