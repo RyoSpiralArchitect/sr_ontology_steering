@@ -1670,3 +1670,151 @@ it is less clean. At high alpha it also damages normal or thin-identity
 controls. This makes reverse steering useful as causal evidence that the
 selected head subsets carry bidirectional refusal/code state, but risky as a
 practical steering method.
+
+## Repair Steering Maps Follow-Up
+
+### Heatmaps And Interaction Indices
+
+Report command:
+
+```bash
+python ontology_steer_monolith.py basin-grid-report \
+  --jsonl ../target/ontology_steer/llama32_3b_basin_steer_grid_fish_full_to_repair.jsonl \
+  --metrics code_mass refusal_mass margin kl \
+  --prompt-kind target \
+  --save-csv ../target/ontology_steer/llama32_3b_basin_steer_grid_fish_full_to_repair_interactions.csv \
+  --save-svg-dir ../target/ontology_steer/heatmaps
+```
+
+Generated heatmap SVGs:
+
+```text
+../target/ontology_steer/heatmaps/user_spell_06_full_spell_target_code_mass.svg
+../target/ontology_steer/heatmaps/user_spell_06_full_spell_target_refusal_mass.svg
+../target/ontology_steer/heatmaps/user_spell_06_full_spell_target_margin.svg
+../target/ontology_steer/heatmaps/user_spell_06_full_spell_target_kl.svg
+```
+
+The heatmap view supports the safer version of the earlier superadditivity
+intuition. Code probability changes sharply after the release axis crosses a
+threshold, but margin changes are smoother and more nearly additive/saturating.
+This keeps the claim at:
+
+```text
+thresholded basin competition,
+not yet a proven nonlinear circuit interaction.
+```
+
+### Cross-Entity Target Grids
+
+Fish-derived repair direction applied across targets:
+
+```bash
+python ontology_steer_monolith.py basin-steer-grid \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case user_spell_07_full_spell_waterproof_keyboard \
+  --target-case user_spell_06_full_spell \
+  --code-heads 15:1 15:23 10:22 10:0 14:20 12:2 \
+  --release-heads 15:15 14:5 13:2 13:18 14:3 \
+  --alpha-code 0 0.5 1 1.5 2 \
+  --alpha-release 0 0.5 1 1.5 2 \
+  --control-cases cross_clock_00_full_spell cross_statue_00_full_spell \
+  --control-mode all \
+  --save-jsonl ../target/ontology_steer/llama32_3b_basin_steer_grid_fish_direction_cross_controls_5x5.jsonl
+```
+
+Best 5x5 points:
+
+| Direction | Target | Best Alpha Code | Best Alpha Release | Code Mass | Refusal Mass | Margin | Top |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| fish-derived | fish full | 2.0 | 1.5 | 0.778 | 0.205 | 7.713 | `def` |
+| fish-derived | clock full | 1.0 | 2.0 | 0.940 | 0.035 | 6.392 | `def` |
+| fish-derived | statue full | 0.5 | 2.0 | 0.990 | 0.005 | 6.936 | `def` |
+| clock-specific | clock full | 1.0 | 1.5 | 0.786 | 0.164 | 6.400 | `def` |
+| statue-specific | statue full | 0.5 | 1.5 | 0.973 | 0.013 | 7.628 | `def` |
+
+Interpretation:
+
+The fish-derived repair direction is not merely fish-specific. It transfers
+strongly to held-out clock and statue full-spell refusals. Entity-specific
+deltas are mixed under this fixed head subset: statue-specific repair is strong,
+but clock-specific repair is weaker than the fish-derived direction. That
+suggests the selected heads encode a more general refusal-release trajectory,
+but entity-specific direction quality also depends on the source repair prompt
+and on whether these heads are the right subset for that entity.
+
+### General Repair Direction
+
+General direction command:
+
+```bash
+python ontology_steer_monolith.py basin-steer-grid \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case user_spell_07_full_spell_waterproof_keyboard \
+  --target-case user_spell_06_full_spell \
+  --direction-pairs \
+    user_spell_07_full_spell_waterproof_keyboard:user_spell_06_full_spell \
+    cross_clock_05_full_then_capability:cross_clock_00_full_spell \
+    cross_statue_05_full_then_capability:cross_statue_00_full_spell \
+  --code-heads 15:1 15:23 10:22 10:0 14:20 12:2 \
+  --release-heads 15:15 14:5 13:2 13:18 14:3 \
+  --alpha-code 0 0.5 1 1.5 2 \
+  --alpha-release 0 0.5 1 1.5 2 \
+  --control-cases cross_clock_00_full_spell cross_statue_00_full_spell normal_control \
+  --control-mode max \
+  --save-jsonl ../target/ontology_steer/llama32_3b_basin_steer_grid_general_repair_fish_clock_statue_5x5.jsonl
+```
+
+Best general-direction points:
+
+| Target | Best Alpha Code | Best Alpha Release | Code Mass | Refusal Mass | Margin | Top |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| fish full | 0.5 | 1.5 | 0.656 | 0.339 | 7.338 | `def` |
+| clock full control | 2.0 | 2.0 | 0.814 | 0.077 | 7.722 | `def` |
+| statue full control | 2.0 | 2.0 | 0.863 | 0.003 | 8.777 | `def` |
+| normal control | 2.0 | 2.0 | 0.999 | 0.000 | 9.610 | code-fence token |
+
+Interpretation:
+
+The averaged repair direction is broader but weaker. It preserves the normal
+factorial control and still repairs held-out full-spell entities, but it does
+not match the fish-specific direction on fish. This looks like a standard
+specificity/generalization tradeoff: averaging reduces overfit and preserves
+normal code behavior, while diluting the exact fish refusal-release path.
+
+### Per-Head Dose Response
+
+Command:
+
+```bash
+python ontology_steer_monolith.py basin-head-dose \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case user_spell_07_full_spell_waterproof_keyboard \
+  --target-case user_spell_06_full_spell \
+  --code-heads 15:1 15:23 10:22 10:0 14:20 12:2 \
+  --release-heads 15:15 14:5 13:2 13:18 14:3 \
+  --alphas 0 0.25 0.5 1 1.5 2 \
+  --save-jsonl ../target/ontology_steer/llama32_3b_basin_head_dose_fish_full_to_repair.jsonl
+```
+
+Top single-head effects:
+
+| Head | Kind | Best Alpha | Code Mass | Refusal Mass | Margin |
+| --- | --- | ---: | ---: | ---: | ---: |
+| L14H5 | release | 2.0 | 0.034 | 0.955 | 1.463 |
+| L12H2 | code | 2.0 | 0.005 | 0.973 | 0.452 |
+| L15H15 | release | 2.0 | 0.004 | 0.975 | -0.252 |
+| L14H3 | release | 2.0 | 0.004 | 0.985 | -0.289 |
+
+Interpretation:
+
+No single head comes close to the release threshold. L14H5 is the strongest
+individual candidate, but even it only reaches `code_mass=0.034`. The
+behavioral mode switch therefore appears to be a bundle effect across several
+release/code heads, not a single-head switch.

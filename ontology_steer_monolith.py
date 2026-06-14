@@ -5410,15 +5410,45 @@ def steered_logits_with_head_deltas(
     head_dim: int,
     device: torch.device,
 ) -> torch.Tensor:
+    delta_cache = {
+        layer_idx: source_cache[layer_idx] - target_cache[layer_idx]
+        for layer_idx in merge_heads_by_layer(code_heads_by_layer, release_heads_by_layer)
+    }
+    return steered_logits_with_precomputed_head_deltas(
+        model=model,
+        tokenizer=tokenizer,
+        layers=layers,
+        messages=messages,
+        code_heads_by_layer=code_heads_by_layer,
+        release_heads_by_layer=release_heads_by_layer,
+        delta_cache=delta_cache,
+        alpha_code=alpha_code,
+        alpha_release=alpha_release,
+        head_dim=head_dim,
+        device=device,
+    )
+
+
+def steered_logits_with_precomputed_head_deltas(
+    model,
+    tokenizer,
+    layers,
+    messages: List[Message],
+    code_heads_by_layer: Dict[int, List[int]],
+    release_heads_by_layer: Dict[int, List[int]],
+    delta_cache: Dict[int, torch.Tensor],
+    alpha_code: float,
+    alpha_release: float,
+    head_dim: int,
+    device: torch.device,
+) -> torch.Tensor:
     heads_by_layer = merge_heads_by_layer(code_heads_by_layer, release_heads_by_layer)
     handles = []
 
     def make_hook(layer_idx: int):
         def hook(module, inputs):
             h = inputs[0]
-            source_vec = source_cache[layer_idx].to(device=h.device, dtype=h.dtype)
-            target_vec = target_cache[layer_idx].to(device=h.device, dtype=h.dtype)
-            delta = source_vec - target_vec
+            delta = delta_cache[layer_idx].to(device=h.device, dtype=h.dtype)
             h2 = h.clone()
 
             for head_idx in code_heads_by_layer.get(layer_idx, []):
@@ -5483,6 +5513,68 @@ def control_alpha_pairs(
         ]
 
     raise ValueError(f"Unknown control mode: {mode}")
+
+
+def parse_case_pair_specs(specs: Optional[List[str]]) -> List[Tuple[str, str]]:
+    pairs = []
+    for spec in specs or []:
+        if ":" not in spec:
+            raise ValueError(f"Direction pair must be source:target, got {spec!r}")
+        source_case, target_case = spec.split(":", 1)
+        if not source_case or not target_case:
+            raise ValueError(f"Direction pair must be source:target, got {spec!r}")
+        pairs.append((source_case, target_case))
+    return pairs
+
+
+def mean_head_delta_cache(
+    model,
+    tokenizer,
+    layers,
+    cases: Dict[str, List[Message]],
+    pair_specs: List[Tuple[str, str]],
+    layer_indices: List[int],
+    device: torch.device,
+) -> Tuple[Dict[int, torch.Tensor], List[Dict[str, Any]]]:
+    deltas_by_layer: Dict[int, List[torch.Tensor]] = defaultdict(list)
+    details = []
+
+    for source_case, target_case in pair_specs:
+        source_logits, source_cache = collect_source_head_cache(
+            model=model,
+            tokenizer=tokenizer,
+            layers=layers,
+            messages=cases[source_case],
+            layer_indices=layer_indices,
+            device=device,
+        )
+        target_logits, target_cache = collect_source_head_cache(
+            model=model,
+            tokenizer=tokenizer,
+            layers=layers,
+            messages=cases[target_case],
+            layer_indices=layer_indices,
+            device=device,
+        )
+        for layer_idx in layer_indices:
+            deltas_by_layer[layer_idx].append(source_cache[layer_idx] - target_cache[layer_idx])
+        details.append({
+            "source_case": source_case,
+            "target_case": target_case,
+            "source_next_token": None,
+            "target_next_token": None,
+            "source_code_mass": None,
+            "target_code_mass": None,
+            "source_refusal_mass": None,
+            "target_refusal_mass": None,
+        })
+        _ = source_logits
+        _ = target_logits
+
+    return {
+        layer_idx: torch.stack(deltas, dim=0).mean(dim=0)
+        for layer_idx, deltas in deltas_by_layer.items()
+    }, details
 
 
 def basin_steer_record(
@@ -5580,7 +5672,18 @@ def command_basin_steer_grid(args) -> None:
     if not cache_layer_indices:
         raise ValueError("At least one --code-heads or --release-heads value is required")
 
-    case_names = [args.source_case, args.target_case] + (args.control_cases or [])
+    direction_pairs = parse_case_pair_specs(args.direction_pairs)
+    direction_case_names = [
+        case_name
+        for pair in direction_pairs
+        for case_name in pair
+    ]
+    case_names = [
+        args.source_case,
+        args.target_case,
+        *(args.control_cases or []),
+        *direction_case_names,
+    ]
     cases = selected_cases(case_names)
     source_messages = cases[args.source_case]
     target_messages = cases[args.target_case]
@@ -5589,12 +5692,14 @@ def command_basin_steer_grid(args) -> None:
         f"[basin-steer-grid] source={args.source_case} target={args.target_case} "
         f"code_heads={code_heads} release_heads={release_heads}"
     )
+    if direction_pairs:
+        print(f"[direction-pairs] {direction_pairs}")
     print(
         f"[head-layout] n_heads={n_heads} head_dim={head_dim} hidden_size={hidden_size} "
         f"layers={cache_layer_indices}"
     )
 
-    source_logits, source_cache = collect_source_head_cache(
+    source_logits, source_cache_for_pair = collect_source_head_cache(
         model=model,
         tokenizer=tokenizer,
         layers=layers,
@@ -5602,7 +5707,7 @@ def command_basin_steer_grid(args) -> None:
         layer_indices=cache_layer_indices,
         device=device,
     )
-    target_logits, target_cache = collect_source_head_cache(
+    target_logits, target_cache_for_pair = collect_source_head_cache(
         model=model,
         tokenizer=tokenizer,
         layers=layers,
@@ -5612,6 +5717,23 @@ def command_basin_steer_grid(args) -> None:
     )
     source_summary = logits_summary(tokenizer, source_logits, top_k=args.top_k)
     target_summary = logits_summary(tokenizer, target_logits, top_k=args.top_k)
+
+    if direction_pairs:
+        delta_cache, direction_details = mean_head_delta_cache(
+            model=model,
+            tokenizer=tokenizer,
+            layers=layers,
+            cases=cases,
+            pair_specs=direction_pairs,
+            layer_indices=cache_layer_indices,
+            device=device,
+        )
+    else:
+        delta_cache = {
+            layer_idx: source_cache_for_pair[layer_idx] - target_cache_for_pair[layer_idx]
+            for layer_idx in cache_layer_indices
+        }
+        direction_details = []
 
     print(
         "[base] "
@@ -5629,15 +5751,14 @@ def command_basin_steer_grid(args) -> None:
 
     for alpha_release in alpha_release_values:
         for alpha_code in alpha_code_values:
-            logits = steered_logits_with_head_deltas(
+            logits = steered_logits_with_precomputed_head_deltas(
                 model=model,
                 tokenizer=tokenizer,
                 layers=layers,
                 messages=target_messages,
                 code_heads_by_layer=code_heads_by_layer,
                 release_heads_by_layer=release_heads_by_layer,
-                source_cache=source_cache,
-                target_cache=target_cache,
+                delta_cache=delta_cache,
                 alpha_code=alpha_code,
                 alpha_release=alpha_release,
                 head_dim=head_dim,
@@ -5658,6 +5779,8 @@ def command_basin_steer_grid(args) -> None:
             record.update({
                 "source_case": args.source_case,
                 "target_case": args.target_case,
+                "direction_pairs": direction_pairs,
+                "direction_details": direction_details,
                 "code_heads": code_heads,
                 "release_heads": release_heads,
                 "head_layout": {
@@ -5673,15 +5796,14 @@ def command_basin_steer_grid(args) -> None:
         control_messages = cases[control_case]
         control_logits = forward_logits_for_messages(model, tokenizer, control_messages, device)
         for alpha_code, alpha_release in control_pairs:
-            logits = steered_logits_with_head_deltas(
+            logits = steered_logits_with_precomputed_head_deltas(
                 model=model,
                 tokenizer=tokenizer,
                 layers=layers,
                 messages=control_messages,
                 code_heads_by_layer=code_heads_by_layer,
                 release_heads_by_layer=release_heads_by_layer,
-                source_cache=source_cache,
-                target_cache=target_cache,
+                delta_cache=delta_cache,
                 alpha_code=alpha_code,
                 alpha_release=alpha_release,
                 head_dim=head_dim,
@@ -5700,6 +5822,8 @@ def command_basin_steer_grid(args) -> None:
             record.update({
                 "source_case": args.source_case,
                 "target_case": args.target_case,
+                "direction_pairs": direction_pairs,
+                "direction_details": direction_details,
                 "code_heads": code_heads,
                 "release_heads": release_heads,
             })
@@ -5760,6 +5884,362 @@ def command_basin_steer_grid(args) -> None:
     if args.save_csv:
         write_basin_steer_csv(args.save_csv, records)
         print(f"[save-csv] {args.save_csv}")
+
+
+def basin_grid_metric_value(record: Dict[str, Any], metric: str) -> Optional[float]:
+    steered = record.get("steered", {})
+    if metric == "code_mass":
+        return steered.get("code_mass")
+    if metric == "refusal_mass":
+        return steered.get("refusal_mass")
+    if metric == "margin":
+        return steered.get("logit_margin")
+    if metric == "kl":
+        return record.get("kl_base_to_steered")
+    if metric == "code_delta":
+        return record.get("code_delta")
+    if metric == "refusal_delta":
+        return record.get("refusal_delta")
+    if metric == "margin_delta":
+        return record.get("margin_delta")
+    raise ValueError(f"Unknown basin grid metric: {metric}")
+
+
+def basin_grid_interaction(
+    by_pair: Dict[Tuple[float, float], Dict[str, Any]],
+    metric: str,
+    alpha_code: float,
+    alpha_release: float,
+) -> Optional[float]:
+    base = by_pair.get((0.0, 0.0))
+    code_only = by_pair.get((alpha_code, 0.0))
+    release_only = by_pair.get((0.0, alpha_release))
+    combined = by_pair.get((alpha_code, alpha_release))
+    if not base or not code_only or not release_only or not combined:
+        return None
+    vals = [
+        basin_grid_metric_value(row, metric)
+        for row in [combined, code_only, release_only, base]
+    ]
+    if any(v is None for v in vals):
+        return None
+    return float(vals[0]) - float(vals[1]) - float(vals[2]) + float(vals[3])
+
+
+def format_matrix_value(value: Optional[float]) -> str:
+    if value is None:
+        return "    -"
+    return f"{float(value):5.3f}"
+
+
+def print_basin_grid_matrix(case: str, metric: str, rows: List[Dict[str, Any]]) -> None:
+    by_pair = {
+        (float(row["alpha_code"]), float(row["alpha_release"])): row
+        for row in rows
+    }
+    alpha_codes = sorted({pair[0] for pair in by_pair})
+    alpha_releases = sorted({pair[1] for pair in by_pair})
+    print("\n" + "=" * 100)
+    print(f"[grid metric] case={case} metric={metric}")
+    print("=" * 100)
+    header = "a_rel\\a_code  " + "  ".join(f"{alpha_code:>6.2f}" for alpha_code in alpha_codes)
+    print(header)
+    print("-" * len(header))
+    for alpha_release in alpha_releases:
+        vals = []
+        for alpha_code in alpha_codes:
+            row = by_pair.get((alpha_code, alpha_release))
+            vals.append(format_matrix_value(basin_grid_metric_value(row, metric) if row else None))
+        print(f"{alpha_release:>10.2f}  " + "  ".join(vals))
+
+
+def heat_color(value: float, vmin: float, vmax: float) -> str:
+    if vmax <= vmin:
+        t = 0.5
+    else:
+        t = max(0.0, min(1.0, (value - vmin) / (vmax - vmin)))
+    if t < 0.5:
+        u = t / 0.5
+        c0 = (34, 94, 168)
+        c1 = (245, 245, 245)
+    else:
+        u = (t - 0.5) / 0.5
+        c0 = (245, 245, 245)
+        c1 = (202, 75, 47)
+    r = round(c0[0] + u * (c1[0] - c0[0]))
+    g = round(c0[1] + u * (c1[1] - c0[1]))
+    b = round(c0[2] + u * (c1[2] - c0[2]))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def svg_text_escape(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def write_basin_heatmap_svg(
+    path: str,
+    case: str,
+    metric: str,
+    rows: List[Dict[str, Any]],
+) -> None:
+    by_pair = {
+        (float(row["alpha_code"]), float(row["alpha_release"])): row
+        for row in rows
+    }
+    alpha_codes = sorted({pair[0] for pair in by_pair})
+    alpha_releases = sorted({pair[1] for pair in by_pair})
+    values = [
+        basin_grid_metric_value(row, metric)
+        for row in by_pair.values()
+    ]
+    finite = [float(v) for v in values if v is not None and math.isfinite(float(v))]
+    if not finite:
+        return
+
+    vmin = min(finite)
+    vmax = max(finite)
+    cell = 44
+    left = 92
+    top = 54
+    width = left + cell * len(alpha_codes) + 20
+    height = top + cell * len(alpha_releases) + 58
+    title = f"{case} {metric}"
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        f'<text x="{left}" y="24" font-family="monospace" font-size="14" fill="#111">{svg_text_escape(title)}</text>',
+        f'<text x="{left}" y="{height - 16}" font-family="monospace" font-size="11" fill="#555">x=alpha_code, y=alpha_release, min={vmin:.3f}, max={vmax:.3f}</text>',
+    ]
+
+    for col, alpha_code in enumerate(alpha_codes):
+        x = left + col * cell
+        parts.append(
+            f'<text x="{x + cell / 2}" y="{top - 12}" text-anchor="middle" font-family="monospace" font-size="11">{alpha_code:g}</text>'
+        )
+    for row_idx, alpha_release in enumerate(alpha_releases):
+        y = top + row_idx * cell
+        parts.append(
+            f'<text x="{left - 12}" y="{y + cell / 2 + 4}" text-anchor="end" font-family="monospace" font-size="11">{alpha_release:g}</text>'
+        )
+        for col, alpha_code in enumerate(alpha_codes):
+            x = left + col * cell
+            row = by_pair.get((alpha_code, alpha_release))
+            value = basin_grid_metric_value(row, metric) if row else None
+            if value is None:
+                fill = "#eeeeee"
+                label = "-"
+            else:
+                fill = heat_color(float(value), vmin, vmax)
+                label = f"{float(value):.2f}"
+            parts.append(f'<rect x="{x}" y="{y}" width="{cell}" height="{cell}" fill="{fill}" stroke="#ffffff"/>')
+            parts.append(
+                f'<text x="{x + cell / 2}" y="{y + cell / 2 + 4}" text-anchor="middle" font-family="monospace" font-size="10" fill="#111">{label}</text>'
+            )
+    parts.append("</svg>\n")
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(parts))
+
+
+def command_basin_grid_report(args) -> None:
+    rows = read_jsonl(args.jsonl)
+    metrics = args.metrics or ["code_mass", "refusal_mass", "margin", "kl"]
+    filtered = [
+        row for row in rows
+        if row.get("experiment") == "basin_steer_grid"
+        and row.get("prompt_kind") == args.prompt_kind
+        and (not args.cases or row.get("case") in args.cases)
+    ]
+    groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in filtered:
+        groups[str(row.get("case", "-"))].append(row)
+
+    report_rows = []
+
+    for case in sorted(groups):
+        case_rows = sorted(groups[case], key=lambda r: (float(r["alpha_release"]), float(r["alpha_code"])))
+        by_pair = {
+            (float(row["alpha_code"]), float(row["alpha_release"])): row
+            for row in case_rows
+        }
+        for metric in metrics:
+            print_basin_grid_matrix(case, metric, case_rows)
+            for row in case_rows:
+                alpha_code = float(row["alpha_code"])
+                alpha_release = float(row["alpha_release"])
+                value = basin_grid_metric_value(row, metric)
+                interaction = basin_grid_interaction(by_pair, metric, alpha_code, alpha_release)
+                report_rows.append({
+                    "case": case,
+                    "prompt_kind": args.prompt_kind,
+                    "metric": metric,
+                    "alpha_code": alpha_code,
+                    "alpha_release": alpha_release,
+                    "value": value,
+                    "interaction": interaction,
+                })
+            if args.save_svg_dir:
+                filename = f"{case}_{args.prompt_kind}_{metric}.svg".replace("/", "_")
+                write_basin_heatmap_svg(
+                    os.path.join(args.save_svg_dir, filename),
+                    case=case,
+                    metric=metric,
+                    rows=case_rows,
+                )
+
+    if args.save_csv:
+        os.makedirs(os.path.dirname(args.save_csv) or ".", exist_ok=True)
+        with open(args.save_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "case",
+                    "prompt_kind",
+                    "metric",
+                    "alpha_code",
+                    "alpha_release",
+                    "value",
+                    "interaction",
+                ],
+            )
+            writer.writeheader()
+            for row in report_rows:
+                writer.writerow(row)
+        print(f"[save-csv] {args.save_csv}")
+    if args.save_svg_dir:
+        print(f"[save-svg-dir] {args.save_svg_dir}")
+
+
+def command_basin_head_dose(args) -> None:
+    model, tokenizer, layers, device = load_model_and_tokenizer(args)
+    n_heads, head_dim, hidden_size = infer_attention_head_layout(model, layers)
+    code_heads = parse_head_specs(args.code_heads, len(layers), n_heads)
+    release_heads = parse_head_specs(args.release_heads, len(layers), n_heads)
+    all_heads = code_heads + [head for head in release_heads if head not in set(code_heads)]
+    all_heads_by_layer = group_heads_by_layer(all_heads)
+    layer_indices = sorted(all_heads_by_layer)
+
+    if not layer_indices:
+        raise ValueError("At least one --code-heads or --release-heads value is required")
+
+    cases = selected_cases([args.source_case, args.target_case])
+    source_messages = cases[args.source_case]
+    target_messages = cases[args.target_case]
+
+    print(
+        f"[basin-head-dose] source={args.source_case} target={args.target_case} "
+        f"code_heads={code_heads} release_heads={release_heads}"
+    )
+    print(
+        f"[head-layout] n_heads={n_heads} head_dim={head_dim} hidden_size={hidden_size} "
+        f"layers={layer_indices}"
+    )
+
+    source_logits, source_cache = collect_source_head_cache(
+        model=model,
+        tokenizer=tokenizer,
+        layers=layers,
+        messages=source_messages,
+        layer_indices=layer_indices,
+        device=device,
+    )
+    target_logits, target_cache = collect_source_head_cache(
+        model=model,
+        tokenizer=tokenizer,
+        layers=layers,
+        messages=target_messages,
+        layer_indices=layer_indices,
+        device=device,
+    )
+    delta_cache = {
+        layer_idx: source_cache[layer_idx] - target_cache[layer_idx]
+        for layer_idx in layer_indices
+    }
+    source_summary = logits_summary(tokenizer, source_logits, top_k=args.top_k)
+    target_summary = logits_summary(tokenizer, target_logits, top_k=args.top_k)
+    records = []
+
+    head_specs = [("code", head) for head in code_heads] + [
+        ("release", head) for head in release_heads
+    ]
+
+    for head_kind, (layer_idx, head_idx) in head_specs:
+        for alpha in [float(x) for x in args.alphas]:
+            code_heads_by_layer = {layer_idx: [head_idx]} if head_kind == "code" else {}
+            release_heads_by_layer = {layer_idx: [head_idx]} if head_kind == "release" else {}
+            logits = steered_logits_with_precomputed_head_deltas(
+                model=model,
+                tokenizer=tokenizer,
+                layers=layers,
+                messages=target_messages,
+                code_heads_by_layer=code_heads_by_layer,
+                release_heads_by_layer=release_heads_by_layer,
+                delta_cache=delta_cache,
+                alpha_code=alpha if head_kind == "code" else 0.0,
+                alpha_release=alpha if head_kind == "release" else 0.0,
+                head_dim=head_dim,
+                device=device,
+            )
+            record = basin_steer_record(
+                tokenizer=tokenizer,
+                case_name=args.target_case,
+                prompt_kind=f"single_{head_kind}",
+                base_logits=target_logits,
+                steered_logits=logits,
+                alpha_code=alpha if head_kind == "code" else 0.0,
+                alpha_release=alpha if head_kind == "release" else 0.0,
+                top_k=args.top_k,
+                source_summary=source_summary,
+                target_summary=target_summary,
+            )
+            record.update({
+                "source_case": args.source_case,
+                "target_case": args.target_case,
+                "head_kind": head_kind,
+                "layer": layer_idx,
+                "head": head_idx,
+                "head_label": f"L{layer_idx}H{head_idx}",
+            })
+            records.append(record)
+
+    print("\n" + "=" * 120)
+    print("[single-head dose summary]")
+    print("=" * 120)
+    header = (
+        f"{'head':>8}  {'kind':>7}  {'best_a':>7}  {'best_code':>9}  "
+        f"{'min_ref':>9}  {'best_margin':>11}  top"
+    )
+    print(header)
+    print("-" * len(header))
+    by_head: Dict[Tuple[str, int, int], List[Dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        by_head[(record["head_kind"], record["layer"], record["head"])].append(record)
+    for (head_kind, layer_idx, head_idx), items in sorted(by_head.items()):
+        best_code = max(items, key=lambda r: r["steered"]["code_mass"])
+        min_ref = min(items, key=lambda r: r["steered"]["refusal_mass"])
+        best_margin = max(items, key=lambda r: r["steered"].get("logit_margin") or float("-inf"))
+        print(
+            f"{('L%dH%d' % (layer_idx, head_idx)):>8}  "
+            f"{head_kind:>7}  "
+            f"{fmt_float(best_code['alpha_code'] or best_code['alpha_release'])}  "
+            f"{fmt_float(best_code['steered']['code_mass'], 9)}  "
+            f"{fmt_float(min_ref['steered']['refusal_mass'], 9)}  "
+            f"{fmt_float(best_margin['steered'].get('logit_margin'), 11)}  "
+            f"{best_code['top_token']}"
+        )
+
+    if args.save_jsonl:
+        os.makedirs(os.path.dirname(args.save_jsonl) or ".", exist_ok=True)
+        with open(args.save_jsonl, "w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print(f"[save] {args.save_jsonl}")
 
 
 def normalized_patch_effect(patched: float, target: float, source: float) -> Optional[float]:
@@ -6773,6 +7253,16 @@ def parse_args():
         help="Head specs for refusal-release deltas, e.g. 15:15 14:5.",
     )
     p_basin_grid.add_argument(
+        "--direction-pairs",
+        nargs="*",
+        default=[],
+        help=(
+            "Optional source:target case pairs whose head-slice deltas are "
+            "averaged into the steering direction. When omitted, uses "
+            "--source-case minus --target-case."
+        ),
+    )
+    p_basin_grid.add_argument(
         "--alpha-code",
         nargs="*",
         type=float,
@@ -6794,6 +7284,42 @@ def parse_args():
     p_basin_grid.add_argument("--top-k", type=int, default=8)
     p_basin_grid.add_argument("--save-jsonl", type=str, default=None)
     p_basin_grid.add_argument("--save-csv", type=str, default=None)
+
+    p_basin_grid_report = sub.add_parser("basin-grid-report")
+    p_basin_grid_report.add_argument("--jsonl", required=True)
+    p_basin_grid_report.add_argument(
+        "--metrics",
+        nargs="*",
+        default=["code_mass", "refusal_mass", "margin", "kl"],
+        choices=[
+            "code_mass",
+            "refusal_mass",
+            "margin",
+            "kl",
+            "code_delta",
+            "refusal_delta",
+            "margin_delta",
+        ],
+    )
+    p_basin_grid_report.add_argument("--prompt-kind", default="target")
+    p_basin_grid_report.add_argument("--cases", nargs="*", default=[])
+    p_basin_grid_report.add_argument("--save-csv", type=str, default=None)
+    p_basin_grid_report.add_argument("--save-svg-dir", type=str, default=None)
+
+    p_basin_head_dose = sub.add_parser("basin-head-dose")
+    add_common_model_args(p_basin_head_dose)
+    p_basin_head_dose.add_argument("--source-case", "--repair-case", dest="source_case", required=True)
+    p_basin_head_dose.add_argument("--target-case", required=True)
+    p_basin_head_dose.add_argument("--code-heads", nargs="*", default=[])
+    p_basin_head_dose.add_argument("--release-heads", nargs="*", default=[])
+    p_basin_head_dose.add_argument(
+        "--alphas",
+        nargs="*",
+        type=float,
+        default=[0.0, 0.25, 0.5, 1.0, 1.5, 2.0],
+    )
+    p_basin_head_dose.add_argument("--top-k", type=int, default=8)
+    p_basin_head_dose.add_argument("--save-jsonl", type=str, default=None)
 
     p_span_patch = sub.add_parser("span-contribution-patch")
     add_common_model_args(p_span_patch)
@@ -6861,6 +7387,10 @@ def main():
         command_head_patch(args)
     elif args.command == "basin-steer-grid":
         command_basin_steer_grid(args)
+    elif args.command == "basin-grid-report":
+        command_basin_grid_report(args)
+    elif args.command == "basin-head-dose":
+        command_basin_head_dose(args)
     elif args.command == "span-contribution-patch":
         command_span_contribution_patch(args)
     elif args.command == "compare-runs":

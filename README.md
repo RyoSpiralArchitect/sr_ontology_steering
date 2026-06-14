@@ -488,6 +488,46 @@ python ontology_steer_monolith.py basin-steer-grid \
   --save-csv target/ontology_steer/llama32_3b_basin_steer_grid_fish_full_to_repair.csv
 ```
 
+### Next Phase: Repair Steering Maps
+
+The current signed-basin result suggests an asymmetric two-knob control surface:
+`refusal-release` is the primary mode-switch lever, while `code-positive` heads
+mostly improve margin once refusal is sufficiently reduced. The next phase is
+to turn that observation into a cleaner steering method:
+
+1. Render heatmaps and interaction indices for code mass, refusal mass, margin,
+   and KL so thresholded basin competition can be separated from logit-level
+   additivity.
+2. Evaluate cross-entity targets directly, comparing fish-derived repair heads
+   against clock/statue/entity-specific repair heads.
+3. Build a general repair direction from entity-averaged
+   `repaired - locked` deltas over stable signed head subsets.
+4. Run per-head dose responses to identify which release heads actually move
+   the refusal threshold and which code heads mainly sharpen the post-release
+   margin.
+
+Useful follow-up utilities:
+
+```bash
+python ontology_steer_monolith.py basin-grid-report \
+  --jsonl target/ontology_steer/llama32_3b_basin_steer_grid_fish_full_to_repair.jsonl \
+  --metrics code_mass refusal_mass margin kl \
+  --save-csv target/ontology_steer/llama32_3b_basin_steer_grid_fish_full_to_repair_interactions.csv \
+  --save-svg-dir target/ontology_steer/heatmaps
+```
+
+```bash
+python ontology_steer_monolith.py basin-head-dose \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case user_spell_07_full_spell_waterproof_keyboard \
+  --target-case user_spell_06_full_spell \
+  --code-heads 15:1 15:23 10:22 10:0 14:20 12:2 \
+  --release-heads 15:15 14:5 13:2 13:18 14:3 \
+  --save-jsonl target/ontology_steer/llama32_3b_basin_head_dose_fish_full_to_repair.jsonl
+```
+
 ## Current Findings
 
 Early local runs suggest:
@@ -629,6 +669,22 @@ Early local runs suggest:
   (`alpha_code=2`, `alpha_release=2` gives about `refusal_mass=0.387` and top
   token `I`), but it also causes larger control drift. The repair direction is
   the cleaner steering direction in the current head subset.
+- Interaction heatmaps make the threshold picture visible: code mass rises
+  sharply along the release axis, while logit margin changes more smoothly and
+  KL saturates. This supports "thresholded basin competition" over a simple
+  superadditive-circuit claim.
+- Fish-derived repair steering generalizes surprisingly well to held-out
+  full-spell clock and statue prompts. With a 5x5 grid, clock reached about
+  `code_mass=0.940` and statue about `code_mass=0.990`. Entity-specific deltas
+  were mixed: statue-specific repair was strong, while clock-specific repair was
+  weaker under the same head subset.
+- A three-entity averaged repair direction over fish, clock, and statue was
+  cleaner on `normal_control` but weaker on fish than the fish-specific
+  direction. This suggests averaging improves broadness but can dilute the exact
+  release trajectory.
+- Single-head dose responses stayed weak. L14H5 was the strongest individual
+  release candidate but only reached about `code_mass=0.034`; the mode switch
+  still appears to require a multi-head release bundle.
 
 That last failure is the interesting part: it narrows the next experiment to
 separating identity, affordance, interpretation scope, and override grammar.
