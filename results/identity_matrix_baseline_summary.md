@@ -1133,3 +1133,85 @@ Run the same factorial command on held-out entities:
 Then run order-sensitivity using the factorial insight:
   repair timing should target A+F and F+S locked conditions separately.
 ```
+
+## Cross-Entity Factorial Generalization
+
+Local output files:
+
+```text
+../target/ontology_steer/llama32_3b_factorial_heldout_user_2k.jsonl
+../target/ontology_steer/llama32_3b_factorial_heldout_system_2k.jsonl
+```
+
+The held-out factorial run used `statue`, `locked_door`, and `clock`, then
+combined those results with the earlier fish run using:
+
+```bash
+python ontology_steer_monolith.py factorial-report \
+  --jsonl \
+    ../target/ontology_steer/llama32_3b_factorial_fish_user_2k.jsonl \
+    ../target/ontology_steer/llama32_3b_factorial_fish_system_2k.jsonl \
+    ../target/ontology_steer/llama32_3b_factorial_heldout_user_2k.jsonl \
+    ../target/ontology_steer/llama32_3b_factorial_heldout_system_2k.jsonl
+```
+
+Summary:
+
+| Entity | Placement | Binding Rate | Task Rate | Full Spell Binding | Binding Bits |
+| --- | --- | ---: | ---: | ---: | --- |
+| fish | user | 0.250 | 0.750 | 1.000 | 0110, 0111, 1110, 1111 |
+| fish | system | 0.312 | 0.688 | 1.000 | 0011, 0111, 1011, 1110, 1111 |
+| statue | user | 0.062 | 0.938 | 1.000 | 1111 |
+| statue | system | 0.125 | 0.875 | 1.000 | 1011, 1111 |
+| locked_door | user | 0.000 | 1.000 | 0.000 | - |
+| locked_door | system | 0.062 | 0.938 | 1.000 | 1111 |
+| clock | user | 0.000 | 1.000 | 0.000 | - |
+| clock | system | 0.188 | 0.812 | 1.000 | 1011, 1110, 1111 |
+
+Selected generalization rates:
+
+| Condition | User Placement | System Placement |
+| --- | ---: | ---: |
+| Full spell `1111` binds | 2 / 4 | 4 / 4 |
+| `A + F` / `0110` binds | 1 / 4 | 0 / 4 |
+| `I + F + S` / `1011` binds | 0 / 4 | 3 / 4 |
+| `I + A + F` / `1110` binds | 1 / 4 | 2 / 4 |
+
+Interpretation:
+
+This revises the fish-only factorial story. The fish user-side `actuality +
+affordance` gate is real for fish, but it is not entity-general in this prompt
+set. User-side `A + F` bound fish and released statue, locked door, and clock.
+Full user-side spell only bound fish and statue.
+
+System-side full spell is much more stable: all four tested entities bound under
+`1111`. The strongest held-out system pattern is not `A + F`, but variants that
+include identity plus incapability and often scope. Clock in particular binds
+under `I + F + S`, `I + A + F`, and full spell; locked door only binds under the
+full spell.
+
+Updated claim:
+
+```text
+Stable:
+  full world-state spell in system placement generalizes across tested entities.
+
+Not stable:
+  fish user-side A+F gate as an entity-general rule.
+
+Current best description:
+  world-state binding grammar is provenance-sensitive and entity-wording-sensitive.
+  Scope binder is not a universal cause, but in system placement it helps
+  convert identity + incapability into a binding frame.
+```
+
+Next:
+
+```text
+Use order-sensitivity on two target locks:
+  fish user A+F / 0110
+  clock system I+F+S / 1011
+
+This separates repair timing for a user-side lexical gate from repair timing
+for a system-side identity/incapability/scope gate.
+```

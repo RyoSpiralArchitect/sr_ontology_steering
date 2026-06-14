@@ -2677,6 +2677,140 @@ def command_factorial_ablation(args) -> None:
         print(f"[save] {args.save_jsonl}")
 
 
+def flatten_factorial_result_rows(paths: List[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    experiments = []
+    records = []
+
+    for path in paths:
+        for row in read_jsonl(path):
+            if row.get("experiment") != "factorial_ablation":
+                continue
+            row = {**row, "source_path": path}
+            experiments.append(row)
+            for rec in row.get("records", []):
+                metadata = rec.get("metadata", {})
+                score = rec.get("score") or score_text(rec.get("text", ""))
+                behavior = rec.get("behavior") or grammar_behavior({"text": rec.get("text", ""), "score": score})
+                binding = rec.get("binding_score")
+                if binding is None:
+                    binding = factorial_binding_score(score, behavior)
+                records.append({
+                    **rec,
+                    "source_path": path,
+                    "metadata": metadata,
+                    "score": score,
+                    "behavior": behavior,
+                    "binding_score": float(binding),
+                    "task_artifact": bool(score.get("task_artifact")),
+                    "role_refusal": int(score.get("role_refusal_markers", 0) or 0) > 0,
+                    "ontology": int(score.get("lock_markers", 0) or 0) > 0,
+                    "bits": metadata.get("bits", ""),
+                    "entity": metadata.get("entity", "-"),
+                    "placement": metadata.get("placement", "-"),
+                })
+
+    return experiments, records
+
+
+def command_factorial_report(args) -> None:
+    experiments, records = flatten_factorial_result_rows(args.jsonl)
+    print(f"[factorial-report] files={len(args.jsonl)} experiments={len(experiments)} records={len(records)}")
+
+    groups = defaultdict(list)
+    for record in records:
+        groups[(record["entity"], record["placement"])].append(record)
+
+    print("\n" + "=" * 120)
+    print("[entity x placement summary]")
+    print("=" * 120)
+    header = (
+        f"{'entity':>14}  {'placement':>9}  {'n':>4}  "
+        f"{'bind':>7}  {'task':>7}  {'refuse':>7}  {'ontol':>7}  "
+        f"{'full':>7}  binding_bits"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for key, items in sorted(groups.items()):
+        full = [item for item in items if item["bits"] == args.full_bits]
+        binding_bits = [
+            item["bits"]
+            for item in sorted(items, key=lambda x: x["bits"])
+            if float(item["binding_score"]) >= args.binding_threshold
+        ]
+        print(
+            f"{key[0][:14]:>14}  "
+            f"{key[1][:9]:>9}  "
+            f"{len(items):>4}  "
+            f"{fmt_float(safe_mean([item['binding_score'] for item in items]))}  "
+            f"{fmt_float(safe_mean([float(item['task_artifact']) for item in items]))}  "
+            f"{fmt_float(safe_mean([float(item['role_refusal']) for item in items]))}  "
+            f"{fmt_float(safe_mean([float(item['ontology']) for item in items]))}  "
+            f"{fmt_float(safe_mean([item['binding_score'] for item in full]))}  "
+            f"{','.join(binding_bits) if binding_bits else '-'}"
+        )
+
+    print("\n" + "=" * 120)
+    print("[top binding effects]")
+    print("=" * 120)
+    header = f"{'entity':>14}  {'placement':>9}  {'terms':>34}  {'effect':>7}"
+    print(header)
+    print("-" * len(header))
+
+    effect_rows = []
+    for row in experiments:
+        effects = row.get("effects", {})
+        for group_name, rows in effects.items():
+            if ":" in group_name:
+                entity, placement = group_name.split(":", 1)
+            else:
+                entity = ",".join(row.get("entities", []))
+                placement = row.get("placement", "-")
+            for effect in rows:
+                if effect.get("metric") not in {None, "binding"} and "binding" not in effect:
+                    continue
+                value = effect.get("binding", effect.get("effect"))
+                if value is None:
+                    continue
+                effect_rows.append({
+                    "entity": entity,
+                    "placement": placement,
+                    "terms": effect.get("terms", []),
+                    "effect": float(value),
+                })
+
+    grouped_effects = defaultdict(list)
+    for row in effect_rows:
+        grouped_effects[(row["entity"], row["placement"])].append(row)
+
+    for key, rows in sorted(grouped_effects.items()):
+        rows = sorted(rows, key=lambda row: abs(row["effect"]), reverse=True)
+        for row in rows[:args.top_k]:
+            print(
+                f"{key[0][:14]:>14}  "
+                f"{key[1][:9]:>9}  "
+                f"{'*'.join(row['terms'])[:34]:>34}  "
+                f"{fmt_float(row['effect'])}"
+            )
+
+    if args.show_cases:
+        print("\n" + "=" * 120)
+        print("[binding case previews]")
+        print("=" * 120)
+        shown = 0
+        for record in sorted(records, key=lambda r: (r["entity"], r["placement"], r["bits"])):
+            if record["binding_score"] < args.binding_threshold:
+                continue
+            text = record.get("text", "").replace("\n", " ")
+            print(
+                f"{record['entity']} {record['placement']} bits={record['bits']} "
+                f"behavior={record['behavior']} text={text[:args.preview_chars]}"
+            )
+            shown += 1
+            if shown >= args.show_cases:
+                break
+
+
 def derived_pass(case_name: str, record: Dict[str, Any], strict: bool = False) -> bool:
     bucket = case_bucket(case_name)
     text = record.get("text", "")
@@ -5340,6 +5474,14 @@ def parse_args():
     p_factorial.add_argument("--preview-chars", type=int, default=180)
     p_factorial.add_argument("--save-jsonl", type=str, default=None)
 
+    p_factorial_report = sub.add_parser("factorial-report")
+    p_factorial_report.add_argument("--jsonl", nargs="+", required=True)
+    p_factorial_report.add_argument("--full-bits", default="1111")
+    p_factorial_report.add_argument("--binding-threshold", type=float, default=1.0)
+    p_factorial_report.add_argument("--top-k", type=int, default=5)
+    p_factorial_report.add_argument("--show-cases", type=int, default=16)
+    p_factorial_report.add_argument("--preview-chars", type=int, default=180)
+
     p_circuit = sub.add_parser("circuit-probe")
     add_common_model_args(p_circuit)
     p_circuit.add_argument("--cases", nargs="*", default=None)
@@ -5470,6 +5612,8 @@ def main():
         command_grammar_grid(args)
     elif args.command == "factorial-ablation":
         command_factorial_ablation(args)
+    elif args.command == "factorial-report":
+        command_factorial_report(args)
     elif args.command == "circuit-probe":
         command_circuit_probe(args)
     elif args.command == "activation-patch":

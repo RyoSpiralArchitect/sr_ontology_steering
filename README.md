@@ -347,6 +347,17 @@ python ontology_steer_monolith.py factorial-ablation \
   --save-jsonl target/ontology_steer/llama32_3b_factorial_fish_user_2k.jsonl
 ```
 
+Compare factorial runs across entities and placements:
+
+```bash
+python ontology_steer_monolith.py factorial-report \
+  --jsonl \
+    target/ontology_steer/llama32_3b_factorial_fish_user_2k.jsonl \
+    target/ontology_steer/llama32_3b_factorial_fish_system_2k.jsonl \
+    target/ontology_steer/llama32_3b_factorial_heldout_user_2k.jsonl \
+    target/ontology_steer/llama32_3b_factorial_heldout_system_2k.jsonl
+```
+
 ## Current Findings
 
 Early local runs suggest:
@@ -441,6 +452,13 @@ Early local runs suggest:
   binary main effect in that run. With the same components in the system
   message, `affordance` had the largest effect and `scope` became a visible
   amplifier, especially in the `affordance*scope` interaction.
+- Cross-entity factorial runs revise that first fish-only grammar. Full-spell
+  system placement generalized to all tested entities (`fish`, `statue`,
+  `locked_door`, `clock`), but full-spell user placement only bound fish and
+  statue. The fish-side `actuality + affordance` gate did not broadly
+  generalize: in user placement it bound fish but not statue, locked door, or
+  clock. The current read is entity- and provenance-sensitive binding grammar,
+  not a single entity-general four-factor rule.
 
 That last failure is the interesting part: it narrows the next experiment to
 separating identity, affordance, interpretation scope, and override grammar.
