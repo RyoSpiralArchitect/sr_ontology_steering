@@ -1017,3 +1017,119 @@ Search for smaller multi-head subsets inside the successful L12-L15 joint patch,
 then compare those subsets against span contribution patching and later-token
 residual updates.
 ```
+
+## Complete Factorial Ablation: Identity x Actuality x Affordance x Scope
+
+Local output files:
+
+```text
+../target/ontology_steer/llama32_3b_factorial_fish_user_2k.jsonl
+../target/ontology_steer/llama32_3b_factorial_fish_system_2k.jsonl
+```
+
+The `factorial-ablation` command generates all 16 combinations of:
+
+```text
+I = identity
+A = actuality / not-roleplay world-state wording
+F = affordance / practical incapability wording
+S = scope binder / interpret later requests from this state
+```
+
+It then reports binding, task completion, refusal, ontology talk, and factorial
+effect estimates. Command shape:
+
+```bash
+python ontology_steer_monolith.py factorial-ablation \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --entities fish \
+  --placement user \
+  --max-new-tokens 96 \
+  --max-interaction-order 3 \
+  --save-jsonl ../target/ontology_steer/llama32_3b_factorial_fish_user_2k.jsonl
+```
+
+### User Placement
+
+Binding cases:
+
+| Bits | Components | Behavior |
+| --- | --- | --- |
+| 0110 | A + F | ontology_talk |
+| 0111 | A + F + S | role_refusal |
+| 1110 | I + A + F | role_refusal |
+| 1111 | I + A + F + S | role_refusal |
+
+Strongest binding effects:
+
+| Term | Binding Effect | Present Mean | Absent Mean |
+| --- | ---: | ---: | ---: |
+| actuality | 0.500 | 0.500 | 0.000 |
+| affordance | 0.500 | 0.500 | 0.000 |
+| actuality * affordance | 0.500 | - | - |
+| identity | 0.000 | 0.250 | 0.250 |
+| scope | 0.000 | 0.250 | 0.250 |
+
+Interpretation:
+
+For user-side wording, `actuality` and `affordance` are jointly sufficient in
+this run. The lock appears exactly in conditions where both are present. Fish
+identity is not necessary, and the explicit scope binder is not necessary for
+the binary bind/no-bind outcome. Scope changes refusal style in some cases, but
+not the threshold itself.
+
+This is a strong update against "fish identity causes refusal" and also against
+"scope binder alone causes refusal." The cleaner local claim is:
+
+```text
+user placement:
+  actuality + affordance is the primary binding gate.
+```
+
+### System Placement
+
+Binding cases:
+
+| Bits | Components | Behavior |
+| --- | --- | --- |
+| 0011 | F + S | ontology_talk |
+| 0111 | A + F + S | role_refusal |
+| 1011 | I + F + S | role_refusal |
+| 1110 | I + A + F | role_refusal |
+| 1111 | I + A + F + S | ontology_talk |
+
+Strongest binding effects:
+
+| Term | Binding Effect | Present Mean | Absent Mean |
+| --- | ---: | ---: | ---: |
+| affordance | 0.625 | 0.625 | 0.000 |
+| scope | 0.375 | 0.500 | 0.125 |
+| affordance * scope | 0.375 | - | - |
+| actuality | 0.125 | 0.375 | 0.250 |
+| identity | 0.125 | 0.375 | 0.250 |
+
+Interpretation:
+
+System placement shifts the grammar. `Affordance` becomes the largest main
+effect, and `scope` becomes a visible amplifier. The `F + S` condition binds
+even without fish identity or actuality language. Meanwhile `A + F` without
+identity or scope does not bind in the system placement, unlike the user
+placement run.
+
+That suggests provenance changes which grammar pieces are treated as binding.
+The same words are not simply role-hierarchy invariant features. In user
+placement, "actual world-state plus incapability" is enough. In system
+placement, practical incapability plus a forward scope instruction is especially
+potent.
+
+Updated next step:
+
+```text
+Run the same factorial command on held-out entities:
+  --entities statue locked_door clock
+
+Then run order-sensitivity using the factorial insight:
+  repair timing should target A+F and F+S locked conditions separately.
+```

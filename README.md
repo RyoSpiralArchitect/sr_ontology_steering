@@ -334,6 +334,19 @@ python ontology_steer_monolith.py span-contribution-patch \
   --save-jsonl target/ontology_steer/llama32_3b_span_contrib_affordance_all_heads_12_15_refusal_to_minus_affordance.jsonl
 ```
 
+Run a complete `identity x actuality x affordance x scope` factorial ablation:
+
+```bash
+python ontology_steer_monolith.py factorial-ablation \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --entities fish \
+  --placement user \
+  --max-new-tokens 96 \
+  --save-jsonl target/ontology_steer/llama32_3b_factorial_fish_user_2k.jsonl
+```
+
 ## Current Findings
 
 Early local runs suggest:
@@ -422,6 +435,12 @@ Early local runs suggest:
   same is true for the `repair_keyboard` span into a full-spell target. The
   current evidence points away from a simple direct span-copy mechanism and
   toward a transformed, accumulated multi-layer trajectory.
+- The first complete factorial ablation sharpens the grammar story. With the
+  fish components in the user message, binding appeared exactly when
+  `actuality` and `affordance` were both present; `identity` and `scope` had no
+  binary main effect in that run. With the same components in the system
+  message, `affordance` had the largest effect and `scope` became a visible
+  amplifier, especially in the `affordance*scope` interaction.
 
 That last failure is the interesting part: it narrows the next experiment to
 separating identity, affordance, interpretation scope, and override grammar.

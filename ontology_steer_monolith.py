@@ -2242,7 +2242,11 @@ def grammar_record(row: Dict[str, Any], rec: Dict[str, Any]) -> Dict[str, Any]:
     case_name = rec.get("case", "")
     text = rec.get("text", "")
     score = score_text(text)
-    metadata = case_metadata(case_name)
+    metadata = {
+        **case_metadata(case_name),
+        **rec.get("metadata", {}),
+    }
+    metadata["case"] = case_name
     behavior = grammar_behavior({**rec, "score": score})
 
     return {
@@ -2297,6 +2301,380 @@ def summarize_grammar_group(items: List[Dict[str, Any]]) -> Dict[str, Any]:
         "collapse_rate": safe_mean([float(item["collapse"]) for item in items]),
         "behavior_counts": dict(behavior_counts),
     }
+
+
+FACTORIAL_COMPONENTS = ["identity", "actuality", "affordance", "scope"]
+
+
+def factorial_entity_parts(entity_name: str) -> Dict[str, str]:
+    if entity_name == "fish":
+        return {
+            "identity": FISH_IDENTITY,
+            "actuality": FISH_ACTUALITY,
+            "affordance": FISH_AFFORDANCE,
+            "scope": FISH_SCOPE,
+        }
+
+    if entity_name in CROSS_ENTITY_COMPONENTS:
+        parts = CROSS_ENTITY_COMPONENTS[entity_name]
+        return {
+            "identity": parts["identity"],
+            "actuality": FISH_ACTUALITY,
+            "affordance": parts["affordance"],
+            "scope": FISH_SCOPE,
+        }
+
+    known = ["fish", *sorted(CROSS_ENTITY_COMPONENTS)]
+    raise ValueError(f"Unknown factorial entity {entity_name!r}. Known: {known}")
+
+
+def factorial_bits_label(bits: Dict[str, bool]) -> str:
+    return "".join("1" if bits[name] else "0" for name in FACTORIAL_COMPONENTS)
+
+
+def factorial_component_label(bits: Dict[str, bool]) -> str:
+    short = {
+        "identity": "I",
+        "actuality": "A",
+        "affordance": "F",
+        "scope": "S",
+    }
+    return "_".join(
+        f"{short[name]}{int(bits[name])}"
+        for name in FACTORIAL_COMPONENTS
+    )
+
+
+def build_factorial_ablation_cases(
+    entities: List[str],
+    placement: str,
+) -> List[Dict[str, Any]]:
+    specs = []
+
+    for entity_name in entities:
+        parts = factorial_entity_parts(entity_name)
+
+        for values in itertools.product([False, True], repeat=len(FACTORIAL_COMPONENTS)):
+            bits = dict(zip(FACTORIAL_COMPONENTS, values))
+            included = [
+                parts[name]
+                for name in FACTORIAL_COMPONENTS
+                if bits[name]
+            ]
+            prefix = spell_text(*included)
+            bit_label = factorial_bits_label(bits)
+            component = factorial_component_label(bits)
+            case_name = f"factorial_{entity_name}_{placement}_{bit_label}"
+
+            if placement == "user":
+                messages = [{"role": "user", "content": spell_text(prefix, OVERRIDE_TASK)}]
+                provenance = "user_factorial"
+            elif placement == "system":
+                system_text = prefix if prefix else NORMAL_SYSTEM
+                messages = [
+                    {"role": "system", "content": system_text},
+                    {"role": "user", "content": OVERRIDE_TASK},
+                ]
+                provenance = "system_factorial"
+            else:
+                raise ValueError(f"Unknown factorial placement {placement!r}")
+
+            metadata = {
+                "probe_group": "factorial_ablation",
+                "component": component,
+                "entity": entity_name,
+                "placement": placement,
+                "provenance": provenance,
+                "bits": bit_label,
+                "n_components": str(sum(int(v) for v in bits.values())),
+                **{name: int(bits[name]) for name in FACTORIAL_COMPONENTS},
+            }
+            specs.append({
+                "case": case_name,
+                "messages": messages,
+                "metadata": metadata,
+            })
+
+    return specs
+
+
+def factorial_binding_score(score: Dict[str, Any], behavior: str) -> float:
+    has_task = bool(score.get("task_artifact"))
+    has_lock = int(score.get("lock_markers", 0) or 0) > 0
+    has_refusal = int(score.get("role_refusal_markers", 0) or 0) > 0
+    has_meta = int(score.get("meta_escape_markers", 0) or 0) > 0
+
+    if has_meta and not (has_lock or has_refusal):
+        return 0.0
+    if (has_lock or has_refusal) and not has_task:
+        return 1.0
+    if behavior == "mixed" or (has_lock or has_refusal):
+        return 0.5
+    return 0.0
+
+
+def factorial_metric_value(record: Dict[str, Any], metric: str) -> float:
+    if metric == "binding":
+        return float(record.get("binding_score", 0.0))
+    if metric == "task":
+        return float(record.get("task_artifact", False))
+    if metric == "refusal":
+        return float(record.get("role_refusal", False))
+    if metric == "ontology":
+        return float(record.get("ontology", False))
+    if metric == "mixed":
+        return float(record.get("mixed", False))
+    if metric == "meta":
+        return float(record.get("meta_reclass", False))
+    raise ValueError(f"Unknown factorial metric: {metric}")
+
+
+def factorial_effect_estimates(
+    records: List[Dict[str, Any]],
+    metric: str,
+    max_order: int,
+) -> List[Dict[str, Any]]:
+    effects = []
+    max_order = min(max_order, len(FACTORIAL_COMPONENTS))
+
+    for order in range(1, max_order + 1):
+        for subset in itertools.combinations(FACTORIAL_COMPONENTS, order):
+            signed_vals = []
+            high_vals = []
+            low_vals = []
+
+            for record in records:
+                bits = record.get("factor_bits", {})
+                sign = 1
+                for name in subset:
+                    sign *= 1 if bits.get(name) else -1
+                value = factorial_metric_value(record, metric)
+                signed_vals.append(sign * value)
+
+                if order == 1:
+                    if bits.get(subset[0]):
+                        high_vals.append(value)
+                    else:
+                        low_vals.append(value)
+
+            effect = 2.0 * safe_mean(signed_vals, default=0.0)
+            row = {
+                "terms": list(subset),
+                "order": order,
+                "metric": metric,
+                "effect": effect,
+            }
+
+            if order == 1:
+                row["present_mean"] = safe_mean(high_vals, default=0.0)
+                row["absent_mean"] = safe_mean(low_vals, default=0.0)
+
+            effects.append(row)
+
+    return effects
+
+
+def print_factorial_grid(records: List[Dict[str, Any]], preview_chars: int) -> None:
+    print("\n" + "=" * 120)
+    print("[factorial grid]")
+    print("=" * 120)
+    header = (
+        f"{'entity':>12}  {'bits':>4}  {'I':>1} {'A':>1} {'F':>1} {'S':>1}  "
+        f"{'bind':>5}  {'task':>4}  {'ref':>3}  {'ont':>3}  "
+        f"{'behavior':>16}  case  preview"
+    )
+    print(header)
+    print("-" * len(header))
+
+    rows = sorted(
+        records,
+        key=lambda r: (
+            r["metadata"].get("entity", ""),
+            r["metadata"].get("placement", ""),
+            r["metadata"].get("bits", ""),
+        ),
+    )
+
+    for record in rows:
+        metadata = record["metadata"]
+        bits = record["factor_bits"]
+        text = record.get("text", "").replace("\n", " ")
+        print(
+            f"{metadata.get('entity', '-')[:12]:>12}  "
+            f"{metadata.get('bits', '-'):>4}  "
+            f"{int(bits['identity']):>1} "
+            f"{int(bits['actuality']):>1} "
+            f"{int(bits['affordance']):>1} "
+            f"{int(bits['scope']):>1}  "
+            f"{record['binding_score']:>5.2f}  "
+            f"{int(record['task_artifact']):>4}  "
+            f"{int(record['role_refusal']):>3}  "
+            f"{int(record['ontology']):>3}  "
+            f"{record['behavior'][:16]:>16}  "
+            f"{record['case']}  "
+            f"{text[:preview_chars]}"
+        )
+
+
+def print_factorial_effects(
+    records: List[Dict[str, Any]],
+    max_order: int,
+) -> Dict[str, Any]:
+    grouped = defaultdict(list)
+
+    for record in records:
+        metadata = record.get("metadata", {})
+        grouped[(metadata.get("entity", "-"), metadata.get("placement", "-"))].append(record)
+
+    all_effects = {}
+
+    for key, items in sorted(grouped.items()):
+        print("\n" + "=" * 120)
+        print(f"[factorial effects] entity={key[0]} placement={key[1]}")
+        print("=" * 120)
+        header = (
+            f"{'terms':>34}  {'bind':>7}  {'task':>7}  "
+            f"{'refuse':>7}  {'ontol':>7}  {'mixed':>7}"
+        )
+        print(header)
+        print("-" * len(header))
+
+        metrics = ["binding", "task", "refusal", "ontology", "mixed"]
+        effects_by_metric = {
+            metric: factorial_effect_estimates(items, metric, max_order)
+            for metric in metrics
+        }
+        by_terms = {}
+
+        for metric, rows in effects_by_metric.items():
+            for row in rows:
+                terms_key = tuple(row["terms"])
+                by_terms.setdefault(terms_key, {"terms": list(terms_key), "order": row["order"]})
+                by_terms[terms_key][metric] = row["effect"]
+                if row["order"] == 1 and metric == "binding":
+                    by_terms[terms_key]["present_mean"] = row.get("present_mean")
+                    by_terms[terms_key]["absent_mean"] = row.get("absent_mean")
+
+        rows = sorted(
+            by_terms.values(),
+            key=lambda row: (row["order"], row["terms"]),
+        )
+
+        for row in rows:
+            terms = "*".join(row["terms"])
+            print(
+                f"{terms[:34]:>34}  "
+                f"{fmt_float(row.get('binding'))}  "
+                f"{fmt_float(row.get('task'))}  "
+                f"{fmt_float(row.get('refusal'))}  "
+                f"{fmt_float(row.get('ontology'))}  "
+                f"{fmt_float(row.get('mixed'))}"
+            )
+
+        strongest = sorted(
+            rows,
+            key=lambda row: abs(float(row.get("binding", 0.0) or 0.0)),
+            reverse=True,
+        )[:8]
+
+        print("\n[strongest binding effects]")
+        for row in strongest:
+            terms = "*".join(row["terms"])
+            extra = ""
+            if row["order"] == 1:
+                extra = (
+                    f" present={fmt_float(row.get('present_mean'))}"
+                    f" absent={fmt_float(row.get('absent_mean'))}"
+                )
+            print(f"  {terms}: effect={fmt_float(row.get('binding'))}{extra}")
+
+        all_effects[f"{key[0]}:{key[1]}"] = rows
+
+    return all_effects
+
+
+def command_factorial_ablation(args) -> None:
+    model, tokenizer, layers, device = load_model_and_tokenizer(args)
+    specs = build_factorial_ablation_cases(args.entities, args.placement)
+    records = []
+
+    print(
+        f"[factorial-ablation] entities={args.entities} "
+        f"placement={args.placement} cases={len(specs)}"
+    )
+
+    for spec in specs:
+        case_name = spec["case"]
+        metadata = spec["metadata"]
+        text = generate_with_interventions(
+            model=model,
+            tokenizer=tokenizer,
+            layers=layers,
+            messages=spec["messages"],
+            interventions=[],
+            device=device,
+            max_new_tokens=args.max_new_tokens,
+            do_sample=args.sample,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
+        )
+        score = score_text(text)
+        behavior = grammar_behavior({"text": text, "score": score})
+        factor_bits = {
+            name: bool(metadata[name])
+            for name in FACTORIAL_COMPONENTS
+        }
+        binding_score = factorial_binding_score(score, behavior)
+        record = {
+            "case": case_name,
+            "metadata": metadata,
+            "messages": spec["messages"],
+            "factor_bits": factor_bits,
+            "text": text,
+            "score": score,
+            "behavior": behavior,
+            "task_artifact": bool(score.get("task_artifact")),
+            "role_refusal": int(score.get("role_refusal_markers", 0) or 0) > 0,
+            "ontology": int(score.get("lock_markers", 0) or 0) > 0,
+            "meta_reclass": int(score.get("meta_escape_markers", 0) or 0) > 0,
+            "mixed": behavior == "mixed",
+            "collapse": behavior == "collapse",
+            "binding_score": binding_score,
+            "rule_pass": binding_score >= 1.0,
+            "objective": binding_score,
+        }
+        records.append(record)
+
+        print(
+            f"[case] {case_name} bits={metadata['bits']} "
+            f"behavior={behavior} binding={binding_score:.2f}"
+        )
+
+    effects = print_factorial_effects(records, max_order=args.max_interaction_order)
+
+    if not args.no_grid:
+        print_factorial_grid(records, preview_chars=args.preview_chars)
+
+    result = {
+        "experiment": "factorial_ablation",
+        "entities": args.entities,
+        "placement": args.placement,
+        "layers": [],
+        "alpha": 0.0,
+        "vector_name": "baseline",
+        "objective": safe_mean([record["binding_score"] for record in records], default=0.0),
+        "rule_pass_rate": safe_mean([float(record["rule_pass"]) for record in records], default=0.0),
+        "factorial_components": FACTORIAL_COMPONENTS,
+        "effects": effects,
+        "records": records,
+    }
+
+    if args.save_jsonl:
+        os.makedirs(os.path.dirname(args.save_jsonl) or ".", exist_ok=True)
+        with open(args.save_jsonl, "w", encoding="utf-8") as f:
+            f.write(json.dumps(result, ensure_ascii=False) + "\n")
+        print(f"[save] {args.save_jsonl}")
 
 
 def derived_pass(case_name: str, record: Dict[str, Any], strict: bool = False) -> bool:
@@ -4938,6 +5316,30 @@ def parse_args():
     p_grid.add_argument("--show-cases", type=int, default=80)
     p_grid.add_argument("--preview-chars", type=int, default=220)
 
+    p_factorial = sub.add_parser("factorial-ablation")
+    add_common_model_args(p_factorial)
+    p_factorial.add_argument(
+        "--entities",
+        nargs="*",
+        default=["fish"],
+        help="Entities to test. Currently supports fish plus cross-entity components: statue locked_door clock.",
+    )
+    p_factorial.add_argument(
+        "--placement",
+        choices=["user", "system"],
+        default="user",
+        help="Place the factorial world-state components in the user or system message.",
+    )
+    p_factorial.add_argument("--max-new-tokens", type=int, default=140)
+    p_factorial.add_argument("--sample", action="store_true")
+    p_factorial.add_argument("--temperature", type=float, default=0.7)
+    p_factorial.add_argument("--top-p", type=float, default=0.9)
+    p_factorial.add_argument("--no-repeat-ngram-size", type=int, default=0)
+    p_factorial.add_argument("--max-interaction-order", type=int, default=3)
+    p_factorial.add_argument("--no-grid", action="store_true")
+    p_factorial.add_argument("--preview-chars", type=int, default=180)
+    p_factorial.add_argument("--save-jsonl", type=str, default=None)
+
     p_circuit = sub.add_parser("circuit-probe")
     add_common_model_args(p_circuit)
     p_circuit.add_argument("--cases", nargs="*", default=None)
@@ -5066,6 +5468,8 @@ def main():
         command_analyze(args)
     elif args.command == "grammar-grid":
         command_grammar_grid(args)
+    elif args.command == "factorial-ablation":
+        command_factorial_ablation(args)
     elif args.command == "circuit-probe":
         command_circuit_probe(args)
     elif args.command == "activation-patch":
