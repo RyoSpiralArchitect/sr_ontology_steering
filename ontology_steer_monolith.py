@@ -2811,6 +2811,240 @@ def command_factorial_report(args) -> None:
                 break
 
 
+ORDER_SENSITIVITY_TARGETS = {
+    "fish_user_af": {
+        "entity": "fish",
+        "placement": "user",
+        "bits": "0110",
+        "repair": FISH_WATERPROOF_KEYBOARD,
+        "description": "fish user A+F / 0110",
+    },
+    "clock_system_ifs": {
+        "entity": "clock",
+        "placement": "system",
+        "bits": "1011",
+        "repair": CROSS_ENTITY_COMPONENTS["clock"]["repair"],
+        "description": "clock system I+F+S / 1011",
+    },
+}
+
+
+def component_text_from_bits(entity_name: str, bits: str) -> str:
+    if len(bits) != len(FACTORIAL_COMPONENTS) or any(ch not in {"0", "1"} for ch in bits):
+        raise ValueError(f"bits must be a {len(FACTORIAL_COMPONENTS)}-digit 0/1 string, got {bits!r}")
+
+    parts = factorial_entity_parts(entity_name)
+    selected = [
+        parts[name]
+        for name, bit in zip(FACTORIAL_COMPONENTS, bits)
+        if bit == "1"
+    ]
+    return spell_text(*selected)
+
+
+def neutral_filler_for_tokens(tokenizer, requested_tokens: int) -> Tuple[str, int]:
+    if requested_tokens <= 0:
+        return "", 0
+
+    unit = " neutral buffer text"
+    chunks = []
+    actual = 0
+
+    while actual < requested_tokens:
+        chunks.append(unit)
+        text = "".join(chunks)
+        actual = len(tokenizer(text, add_special_tokens=False).input_ids)
+
+    return "".join(chunks).strip(), actual
+
+
+def build_order_sensitivity_specs(tokenizer, targets: List[str], delays: List[int]) -> List[Dict[str, Any]]:
+    specs = []
+
+    for target_name in targets:
+        if target_name not in ORDER_SENSITIVITY_TARGETS:
+            known = sorted(ORDER_SENSITIVITY_TARGETS)
+            raise ValueError(f"Unknown order-sensitivity target {target_name!r}. Known: {known}")
+
+        target = ORDER_SENSITIVITY_TARGETS[target_name]
+        entity_name = target["entity"]
+        placement = target["placement"]
+        bits = target["bits"]
+        lock_text = component_text_from_bits(entity_name, bits)
+        repair = target["repair"]
+
+        if placement == "user":
+            no_repair_messages = [{"role": "user", "content": spell_text(lock_text, OVERRIDE_TASK)}]
+        elif placement == "system":
+            no_repair_messages = [
+                {"role": "system", "content": lock_text},
+                {"role": "user", "content": OVERRIDE_TASK},
+            ]
+        else:
+            raise ValueError(f"Unknown placement {placement!r}")
+
+        specs.append({
+            "case": f"order_{target_name}_no_repair",
+            "messages": no_repair_messages,
+            "metadata": {
+                "probe_group": "order_sensitivity",
+                "component": "no_repair",
+                "target": target_name,
+                "description": target["description"],
+                "entity": entity_name,
+                "placement": placement,
+                "bits": bits,
+                "delay_requested": -1,
+                "delay_actual": 0,
+                "repair": "none",
+            },
+        })
+
+        for delay in delays:
+            filler, actual_delay = neutral_filler_for_tokens(tokenizer, delay)
+            component = f"repair_after_{delay:04d}"
+            if placement == "user":
+                messages = [{
+                    "role": "user",
+                    "content": spell_text(lock_text, filler, repair, OVERRIDE_TASK),
+                }]
+            elif placement == "system":
+                messages = [
+                    {"role": "system", "content": lock_text},
+                    {"role": "user", "content": spell_text(filler, repair, OVERRIDE_TASK)},
+                ]
+            else:
+                raise ValueError(f"Unknown placement {placement!r}")
+
+            specs.append({
+                "case": f"order_{target_name}_delay_{delay:04d}",
+                "messages": messages,
+                "metadata": {
+                    "probe_group": "order_sensitivity",
+                    "component": component,
+                    "target": target_name,
+                    "description": target["description"],
+                    "entity": entity_name,
+                    "placement": placement,
+                    "bits": bits,
+                    "delay_requested": delay,
+                    "delay_actual": actual_delay,
+                    "repair": "after_lock",
+                },
+            })
+
+    return specs
+
+
+def repair_success_score(score: Dict[str, Any]) -> bool:
+    return (
+        bool(score.get("task_artifact"))
+        and int(score.get("role_refusal_markers", 0) or 0) == 0
+        and int(score.get("lock_markers", 0) or 0) == 0
+        and int(score.get("meta_escape_markers", 0) or 0) == 0
+        and float(score.get("repetition_penalty", 0.0) or 0.0) < 1.0
+    )
+
+
+def print_order_sensitivity(records: List[Dict[str, Any]], preview_chars: int) -> None:
+    print("\n" + "=" * 120)
+    print("[order-sensitivity]")
+    print("=" * 120)
+    header = (
+        f"{'target':>18}  {'condition':>18}  {'req':>5}  {'actual':>6}  "
+        f"{'repair':>6}  {'bind':>5}  {'task':>4}  {'behavior':>16}  preview"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for record in records:
+        metadata = record["metadata"]
+        text = record.get("text", "").replace("\n", " ")
+        print(
+            f"{metadata['target'][:18]:>18}  "
+            f"{metadata['component'][:18]:>18}  "
+            f"{int(metadata['delay_requested']):>5}  "
+            f"{int(metadata['delay_actual']):>6}  "
+            f"{int(record['repair_success']):>6}  "
+            f"{record['binding_score']:>5.2f}  "
+            f"{int(record['task_artifact']):>4}  "
+            f"{record['behavior'][:16]:>16}  "
+            f"{text[:preview_chars]}"
+        )
+
+
+def command_order_sensitivity(args) -> None:
+    model, tokenizer, layers, device = load_model_and_tokenizer(args)
+    specs = build_order_sensitivity_specs(tokenizer, args.targets, args.delays)
+    records = []
+
+    print(
+        f"[order-sensitivity] targets={args.targets} "
+        f"delays={args.delays} cases={len(specs)}"
+    )
+
+    for spec in specs:
+        text = generate_with_interventions(
+            model=model,
+            tokenizer=tokenizer,
+            layers=layers,
+            messages=spec["messages"],
+            interventions=[],
+            device=device,
+            max_new_tokens=args.max_new_tokens,
+            do_sample=args.sample,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
+        )
+        score = score_text(text)
+        behavior = grammar_behavior({"text": text, "score": score})
+        binding = factorial_binding_score(score, behavior)
+        repair_success = repair_success_score(score)
+        record = {
+            "case": spec["case"],
+            "metadata": spec["metadata"],
+            "messages": spec["messages"],
+            "text": text,
+            "score": score,
+            "behavior": behavior,
+            "binding_score": binding,
+            "repair_success": repair_success,
+            "task_artifact": bool(score.get("task_artifact")),
+            "role_refusal": int(score.get("role_refusal_markers", 0) or 0) > 0,
+            "ontology": int(score.get("lock_markers", 0) or 0) > 0,
+            "meta_reclass": int(score.get("meta_escape_markers", 0) or 0) > 0,
+            "rule_pass": repair_success,
+            "objective": float(repair_success) - binding,
+        }
+        records.append(record)
+        print(
+            f"[case] {record['case']} "
+            f"repair={int(repair_success)} binding={binding:.2f} behavior={behavior}"
+        )
+
+    print_order_sensitivity(records, preview_chars=args.preview_chars)
+
+    result = {
+        "experiment": "order_sensitivity",
+        "targets": args.targets,
+        "delays": args.delays,
+        "layers": [],
+        "alpha": 0.0,
+        "vector_name": "baseline",
+        "objective": safe_mean([record["objective"] for record in records], default=0.0),
+        "repair_success_rate": safe_mean([float(record["repair_success"]) for record in records], default=0.0),
+        "binding_rate": safe_mean([record["binding_score"] for record in records], default=0.0),
+        "records": records,
+    }
+
+    if args.save_jsonl:
+        os.makedirs(os.path.dirname(args.save_jsonl) or ".", exist_ok=True)
+        with open(args.save_jsonl, "w", encoding="utf-8") as f:
+            f.write(json.dumps(result, ensure_ascii=False) + "\n")
+        print(f"[save] {args.save_jsonl}")
+
+
 def derived_pass(case_name: str, record: Dict[str, Any], strict: bool = False) -> bool:
     bucket = case_bucket(case_name)
     text = record.get("text", "")
@@ -5482,6 +5716,23 @@ def parse_args():
     p_factorial_report.add_argument("--show-cases", type=int, default=16)
     p_factorial_report.add_argument("--preview-chars", type=int, default=180)
 
+    p_order = sub.add_parser("order-sensitivity")
+    add_common_model_args(p_order)
+    p_order.add_argument(
+        "--targets",
+        nargs="*",
+        default=["fish_user_af", "clock_system_ifs"],
+        choices=sorted(ORDER_SENSITIVITY_TARGETS),
+    )
+    p_order.add_argument("--delays", nargs="*", type=int, default=[0, 16, 64, 128, 256])
+    p_order.add_argument("--max-new-tokens", type=int, default=140)
+    p_order.add_argument("--sample", action="store_true")
+    p_order.add_argument("--temperature", type=float, default=0.7)
+    p_order.add_argument("--top-p", type=float, default=0.9)
+    p_order.add_argument("--no-repeat-ngram-size", type=int, default=0)
+    p_order.add_argument("--preview-chars", type=int, default=180)
+    p_order.add_argument("--save-jsonl", type=str, default=None)
+
     p_circuit = sub.add_parser("circuit-probe")
     add_common_model_args(p_circuit)
     p_circuit.add_argument("--cases", nargs="*", default=None)
@@ -5614,6 +5865,8 @@ def main():
         command_factorial_ablation(args)
     elif args.command == "factorial-report":
         command_factorial_report(args)
+    elif args.command == "order-sensitivity":
+        command_order_sensitivity(args)
     elif args.command == "circuit-probe":
         command_circuit_probe(args)
     elif args.command == "activation-patch":

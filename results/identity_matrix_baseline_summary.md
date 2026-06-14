@@ -1215,3 +1215,99 @@ Use order-sensitivity on two target locks:
 This separates repair timing for a user-side lexical gate from repair timing
 for a system-side identity/incapability/scope gate.
 ```
+
+## Order Sensitivity: Capability Repair Delay
+
+Local output files:
+
+```text
+../target/ontology_steer/llama32_3b_order_sensitivity_fish_clock_2k.jsonl
+../target/ontology_steer/llama32_3b_order_sensitivity_fish_clock_long_2k.jsonl
+```
+
+The `order-sensitivity` command targets two locked conditions identified by the
+factorial runs:
+
+```text
+fish_user_af:
+  user placement, A+F / 0110
+  repair: waterproof keyboard
+
+clock_system_ifs:
+  system placement, I+F+S / 1011
+  repair: station display that can output Python code
+```
+
+Command shape:
+
+```bash
+python ontology_steer_monolith.py order-sensitivity \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --targets fish_user_af clock_system_ifs \
+  --delays 0 16 64 128 256 \
+  --max-new-tokens 96 \
+  --save-jsonl ../target/ontology_steer/llama32_3b_order_sensitivity_fish_clock_2k.jsonl
+```
+
+Short sweep:
+
+| Target | Requested Delay | Actual Filler Tokens | Repair Success | Binding Score | Behavior |
+| --- | ---: | ---: | ---: | ---: | --- |
+| fish_user_af | no repair | 0 | 0 | 1.00 | ontology_talk |
+| fish_user_af | 0 | 0 | 1 | 0.00 | task_completion |
+| fish_user_af | 16 | 18 | 1 | 0.00 | task_completion |
+| fish_user_af | 64 | 66 | 1 | 0.00 | task_completion |
+| fish_user_af | 128 | 129 | 1 | 0.00 | task_completion |
+| fish_user_af | 256 | 258 | 1 | 0.00 | task_completion |
+| clock_system_ifs | no repair | 0 | 0 | 1.00 | role_refusal |
+| clock_system_ifs | 0 | 0 | 1 | 0.00 | task_completion |
+| clock_system_ifs | 16 | 18 | 1 | 0.00 | task_completion |
+| clock_system_ifs | 64 | 66 | 1 | 0.00 | task_completion |
+| clock_system_ifs | 128 | 129 | 1 | 0.00 | task_completion |
+| clock_system_ifs | 256 | 258 | 1 | 0.00 | task_completion |
+
+Long sweep:
+
+| Target | Requested Delay | Actual Filler Tokens | Repair Success | Binding Score | Behavior |
+| --- | ---: | ---: | ---: | ---: | --- |
+| fish_user_af | 512 | 513 | 1 | 0.00 | task_completion |
+| fish_user_af | 1024 | 1026 | 1 | 0.00 | task_completion |
+| clock_system_ifs | 512 | 513 | 1 | 0.00 | task_completion |
+| clock_system_ifs | 1024 | 1026 | 1 | 0.00 | task_completion |
+
+Interpretation:
+
+No-repair controls lock in both target conditions. But every repair condition
+from zero through roughly 1026 intervening neutral filler tokens restores normal
+factorial code.
+
+This means the first timing hypothesis needs refinement. In this setup, we are
+not seeing gradual decay of repair strength with lock-to-repair distance. A
+concrete capability repair placed immediately before the task is strong enough
+to override both:
+
+```text
+fish user-side A+F lexical lock
+clock system-side I+F+S identity/incapability/scope lock
+```
+
+The current result does not prove that order is irrelevant. It specifically
+shows that neutral filler between lock and repair does not prevent a later
+capability repair from winning. The next sharper test is to move the repair away
+from the task instead:
+
+```text
+repair before neutral buffer + task
+repair before lock + task
+repair in separate earlier user turn, then later task
+```
+
+Updated claim:
+
+```text
+Capability repair is not just a short-range recency effect over the tested
+lock-to-repair distances. It behaves like a strong local execution-frame update
+when placed near the practical task.
+```

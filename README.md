@@ -358,6 +358,19 @@ python ontology_steer_monolith.py factorial-report \
     target/ontology_steer/llama32_3b_factorial_heldout_system_2k.jsonl
 ```
 
+Sweep capability-repair timing after selected locked conditions:
+
+```bash
+python ontology_steer_monolith.py order-sensitivity \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --targets fish_user_af clock_system_ifs \
+  --delays 0 16 64 128 256 \
+  --max-new-tokens 96 \
+  --save-jsonl target/ontology_steer/llama32_3b_order_sensitivity_fish_clock_2k.jsonl
+```
+
 ## Current Findings
 
 Early local runs suggest:
@@ -459,6 +472,11 @@ Early local runs suggest:
   generalize: in user placement it bound fish but not statue, locked door, or
   clock. The current read is entity- and provenance-sensitive binding grammar,
   not a single entity-general four-factor rule.
+- Order-sensitivity runs show no repair decay up to the tested range. For
+  `fish_user_af` and `clock_system_ifs`, no-repair controls locked, but every
+  repair condition from 0 through about 1026 intervening filler tokens restored
+  normal factorial code. In this setup, a concrete capability repair immediately
+  before the task dominates the earlier lock even after a long neutral buffer.
 
 That last failure is the interesting part: it narrows the next experiment to
 separating identity, affordance, interpretation scope, and override grammar.
