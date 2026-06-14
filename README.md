@@ -488,6 +488,24 @@ python ontology_steer_monolith.py basin-steer-grid \
   --save-csv target/ontology_steer/llama32_3b_basin_steer_grid_fish_full_to_repair.csv
 ```
 
+### Next Phase: Repair Steering Maps
+
+The current signed-basin result suggests an asymmetric two-knob control surface:
+`refusal-release` is the primary mode-switch lever, while `code-positive` heads
+mostly improve margin once refusal is sufficiently reduced. The next phase is
+to turn that observation into a cleaner steering method:
+
+1. Render heatmaps and interaction indices for code mass, refusal mass, margin,
+   and KL so thresholded basin competition can be separated from logit-level
+   additivity.
+2. Evaluate cross-entity targets directly, comparing fish-derived repair heads
+   against clock/statue/entity-specific repair heads.
+3. Build a general repair direction from entity-averaged
+   `repaired - locked` deltas over stable signed head subsets.
+4. Run per-head dose responses to identify which release heads actually move
+   the refusal threshold and which code heads mainly sharpen the post-release
+   margin.
+
 ## Current Findings
 
 Early local runs suggest:
