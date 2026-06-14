@@ -816,6 +816,7 @@ Local output files:
 
 ```text
 ../target/ontology_steer/llama32_3b_head_all_layers_12_15_refusal_to_minus_affordance.jsonl
+../target/ontology_steer/llama32_3b_head_all_joint_12_15_refusal_to_minus_affordance.jsonl
 ../target/ontology_steer/llama32_3b_head_affordance_candidates_refusal_to_minus_affordance.jsonl
 ../target/ontology_steer/llama32_3b_head_repair_candidates_repair_to_full.jsonl
 ../target/ontology_steer/llama32_3b_head_all_but_one_12_15_refusal_to_minus_affordance.jsonl
@@ -853,6 +854,12 @@ python ontology_steer_monolith.py head-patch \
 | L14 all heads | 0.002 | 0.229 | 0.000 / 0.987 |
 | L15 all heads | 0.000 | 0.205 | 0.001 / 0.990 |
 
+Joint all-heads across L12-L15:
+
+| Patch | Heads Patched | Source Effect | Margin Effect | Patched Refusal / Code |
+| --- | ---: | ---: | ---: | ---: |
+| L12-L15 all heads jointly | 96 | 0.761 | 0.669 | 0.621 / 0.111 |
+
 Interpretation:
 
 Patching all heads in a single layer is much weaker than patching the whole
@@ -860,6 +867,13 @@ Patching all heads in a single layer is much weaker than patching the whole
 head-slice view, but it still only reaches source effect 0.034 by mass. The
 larger `attn_out 12-15` window effect therefore does not reduce to one layer's
 head-concat output.
+
+The joint L12-L15 all-head patch exactly recovers the earlier `attn_out 12-15`
+window result by mass and margin. This checks that the pre-`o_proj` head-slice
+patch point can reproduce the full attention-output window when all heads across
+the relevant layers are patched together. The negative result is therefore
+specific to single-layer and single-head localization, not a failure of the
+decomposition point itself.
 
 ### Attention-Mass Candidate Heads
 
@@ -914,13 +928,14 @@ Strong:
   L12-L15 is the strongest local window.
   L12 is the strongest single pre-o_proj all-head layer.
   L12H16 is the best current head-level candidate.
+  L12-L15 all-heads jointly reproduce the window patch effect.
 
 Still not established:
   any single causal head.
   L14H10 as a writer.
-  whether o_proj-input head slices are the right decomposition point.
+  whether any smaller multi-head subset is sufficient.
 
 Next:
-  patch all heads across multiple layers jointly,
+  search multi-head subsets inside L12-L15,
   then implement span-restricted head contribution patching.
 ```

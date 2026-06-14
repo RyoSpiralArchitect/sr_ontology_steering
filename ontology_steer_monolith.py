@@ -3806,6 +3806,22 @@ def build_head_patch_plans(
             })
         return plans
 
+    if mode == "all-heads-joint":
+        if not layer_indices:
+            raise ValueError("all-heads-joint mode requires --layers")
+        heads_by_layer = {
+            layer_idx: list(range(n_heads))
+            for layer_idx in layer_indices
+        }
+        plans.append({
+            "patch_label": f"L{compact_layer_span(layer_indices)}:all_joint",
+            "heads_by_layer": heads_by_layer,
+            "layer": None,
+            "head": None,
+            "omitted_head": None,
+        })
+        return plans
+
     if mode == "selected-heads":
         if not selected_heads:
             raise ValueError("selected-heads mode requires --heads")
@@ -4632,9 +4648,9 @@ def parse_args():
     p_head.add_argument("--target-case", required=True)
     p_head.add_argument(
         "--mode",
-        choices=["all-heads", "selected-heads", "all-but-one"],
+        choices=["all-heads", "all-heads-joint", "selected-heads", "all-but-one"],
         required=True,
-        help="Patch all heads by layer, selected layer:head specs, or all heads except one per layer.",
+        help="Patch all heads by layer, all specified layers jointly, selected layer:head specs, or all heads except one per layer.",
     )
     p_head.add_argument(
         "--layers",

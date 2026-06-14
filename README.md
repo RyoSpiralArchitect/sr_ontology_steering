@@ -300,9 +300,9 @@ python ontology_steer_monolith.py head-patch \
   --dtype float16 \
   --source-case ablate_00_full_spell \
   --target-case ablate_03_full_minus_affordance \
-  --mode all-heads \
+  --mode all-heads-joint \
   --layers 12 13 14 15 \
-  --save-jsonl target/ontology_steer/llama32_3b_head_all_layers_12_15_refusal_to_minus_affordance.jsonl
+  --save-jsonl target/ontology_steer/llama32_3b_head_all_joint_12_15_refusal_to_minus_affordance.jsonl
 ```
 
 ```bash
@@ -396,7 +396,9 @@ Early local runs suggest:
   by layer is weak compared with full `attn_out` window patching, and attention
   mass candidates such as L14/H10 or L12/H16 are weak when patched alone. L12/H16
   is the largest all-but-one contributor inside L12, but it is not sufficient by
-  itself.
+  itself. Patching all heads jointly across L12-L15 reproduces the earlier
+  `attn_out 12-15` effect, confirming that the effect is distributed across the
+  multi-layer head trajectory rather than lost in the pre-`o_proj` decomposition.
 
 That last failure is the interesting part: it narrows the next experiment to
 separating identity, affordance, interpretation scope, and override grammar.
