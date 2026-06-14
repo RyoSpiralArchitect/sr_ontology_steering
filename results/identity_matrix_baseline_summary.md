@@ -511,3 +511,112 @@ Next probe:
 Move from span occlusion to true activation patching. Use paired prompts such as
 `full_spell` vs `minus_affordance` and patch attention outputs or MLP outputs by
 layer/head to find which components flip refusal mass into code mass.
+
+## Activation Patch: Final Decision State
+
+Local commands:
+
+```bash
+python ontology_steer_monolith.py activation-patch \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case ablate_00_full_spell \
+  --target-case cap_order_00_full_then_waterproof_keyboard \
+  --components resid_post attn_out mlp_out \
+  --layers 0-27 \
+  --top-k 6 \
+  --top-k-rows 20 \
+  --save-jsonl ../target/ontology_steer/llama32_3b_patch_1_refusal_to_repair.jsonl
+```
+
+```bash
+python ontology_steer_monolith.py activation-patch \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case ablate_00_full_spell \
+  --target-case ablate_03_full_minus_affordance \
+  --components resid_post attn_out mlp_out \
+  --layers 0-27 \
+  --top-k 6 \
+  --top-k-rows 20 \
+  --save-jsonl ../target/ontology_steer/llama32_3b_patch_2_refusal_to_minus_affordance.jsonl
+```
+
+```bash
+python ontology_steer_monolith.py activation-patch \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case cap_order_00_full_then_waterproof_keyboard \
+  --target-case ablate_00_full_spell \
+  --components resid_post attn_out mlp_out \
+  --layers 0-27 \
+  --top-k 6 \
+  --top-k-rows 20 \
+  --save-jsonl ../target/ontology_steer/llama32_3b_patch_3_repair_to_full.jsonl
+```
+
+Metric:
+
+```text
+refusal_effect = (patched_refusal - target_refusal) / (source_refusal - target_refusal)
+code_effect    = (patched_code    - target_code)    / (source_code    - target_code)
+source_effect  = mean(refusal_effect, code_effect)
+```
+
+`source_effect = 1.0` means the patched target exactly matches source behavior
+on refusal/code mass. `0.0` means no movement from target.
+
+### Patch Pair Summary
+
+| Pair | Source -> Target | Source Refusal / Code | Target Refusal / Code | Best Patch | Best Source Effect |
+| --- | --- | --- | --- | --- | ---: |
+| 1 | `full_spell` -> `full_then_waterproof_keyboard` | 0.979744 / 0.000357 | 0.000004 / 0.971101 | `resid_post` L27 | 1.000 |
+| 2 | `full_spell` -> `minus_affordance` | 0.979744 / 0.000357 | 0.000022 / 0.990162 | `resid_post` L27 | 1.000 |
+| 3 | `full_then_waterproof_keyboard` -> `full_spell` | 0.000004 / 0.971101 | 0.979744 / 0.000357 | `resid_post` L27 | 1.000 |
+
+### Layer Pattern
+
+Late residual stream patching is very strong:
+
+| Pair | `resid_post` L27 | L26 | L25 / L23 | L20 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 refusal -> repaired | 1.000 | 0.982 | 0.864 / 0.844 | 0.575 |
+| 2 refusal -> minus affordance | 1.000 | 0.987 | 0.898 / 0.898 | 0.773 |
+| 3 repair -> full | 1.000 | 0.997 | 0.985 / 0.986 | 0.924 |
+
+Single component patches were much weaker:
+
+| Pair | Best `attn_out` | Best `mlp_out` |
+| --- | --- | --- |
+| 1 refusal -> repaired | L13, source effect 0.027 | L14, source effect 0.041 |
+| 2 refusal -> minus affordance | L12, source effect 0.034 | L13, source effect 0.163 |
+| 3 repair -> full | L12, source effect 0.074 | L12, source effect 0.020 |
+
+Interpretation:
+
+The first activation-patch pass shows that the final refusal/code decision state
+is highly transferable in the late residual stream. This is true in both
+directions: refusal can be patched into repaired/code targets, and repaired/code
+can be patched into full-spell/refusal targets. By layer 20, residual patches
+already move the target substantially toward the source; by layers 26-27 they
+nearly copy source behavior.
+
+This is not yet a localized head-level circuit. In fact, isolated `attn_out` and
+`mlp_out` patches are weak compared with residual patches. That means the
+current reliable object is the accumulated final-position decision state, not
+yet the individual component that writes it.
+
+Updated patching hypothesis:
+
+```text
+affordance / repair spans shape an accumulated final-position state.
+That state is easy to transfer through late residual stream patching.
+Single attention-output or MLP-output patches do not yet isolate the writer.
+The next step should decompose the late residual effect with narrower patching:
+  - patch ranges of layers instead of single layers,
+  - patch head outputs inside promising attention layers,
+  - patch MLPs around layers 12-15 where weak effects first appear.
+```

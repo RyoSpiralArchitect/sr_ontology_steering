@@ -234,6 +234,20 @@ python ontology_steer_monolith.py circuit-probe \
   --save-jsonl target/ontology_steer/llama32_3b_circuit_probe_core.jsonl
 ```
 
+Patch final-position activations from a source case into a target case:
+
+```bash
+python ontology_steer_monolith.py activation-patch \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case ablate_00_full_spell \
+  --target-case cap_order_00_full_then_waterproof_keyboard \
+  --components resid_post attn_out mlp_out \
+  --layers 0-27 \
+  --save-jsonl target/ontology_steer/llama32_3b_patch_1_refusal_to_repair.jsonl
+```
+
 ## Current Findings
 
 Early local runs suggest:
@@ -288,6 +302,12 @@ Early local runs suggest:
   while raising code mass. In the capability-repair prompt, occluding the
   waterproof-keyboard span restores refusal. Attention inspection also surfaces
   recurring task-tracking heads and an affordance-heavy head around layer 14.
+- Initial final-position activation patching strongly transfers behavior
+  through late residual stream states. Patching `resid_post` from refusal to
+  repaired/code prompts, or from repaired/code to refusal prompts, almost fully
+  moves refusal/code mass toward the source in late layers. Single `attn_out`
+  and `mlp_out` patches are much weaker so far, suggesting the first reliable
+  signal is the accumulated decision state rather than an isolated component.
 
 That last failure is the interesting part: it narrows the next experiment to
 separating identity, affordance, interpretation scope, and override grammar.
