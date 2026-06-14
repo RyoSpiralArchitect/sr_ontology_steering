@@ -939,3 +939,81 @@ Next:
   search multi-head subsets inside L12-L15,
   then implement span-restricted head contribution patching.
 ```
+
+## Span Contribution Patch: First Pass
+
+Local output files:
+
+```text
+../target/ontology_steer/llama32_3b_span_contrib_smoke_affordance_l12h16.jsonl
+../target/ontology_steer/llama32_3b_span_contrib_affordance_all_heads_12_15_refusal_to_minus_affordance.jsonl
+../target/ontology_steer/llama32_3b_span_contrib_repair_all_heads_12_15_repair_to_full.jsonl
+```
+
+The `span-contribution-patch` command isolates a narrower hypothesis than
+ordinary head-slice patching. Instead of copying the whole final-token head
+output, it computes only the value contribution attributable to a named source
+span:
+
+```text
+contribution(head, span) =
+  sum over source span tokens attention(final_token, token) * value(token)
+```
+
+That source span contribution is then added into the matching target
+final-token head slice before the layer's `o_proj`. For grouped-query attention,
+query heads are mapped onto their corresponding key/value head group. In this
+Llama 3B run:
+
+```text
+n_heads = 24
+kv_heads = 8
+head_dim = 128
+hidden_size = 3072
+```
+
+Command shape:
+
+```bash
+python ontology_steer_monolith.py span-contribution-patch \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case ablate_00_full_spell \
+  --target-case ablate_03_full_minus_affordance \
+  --source-span affordance \
+  --all-heads \
+  --layers 12 13 14 15 \
+  --save-jsonl ../target/ontology_steer/llama32_3b_span_contrib_affordance_all_heads_12_15_refusal_to_minus_affordance.jsonl
+```
+
+Initial results:
+
+| Patch | Heads Patched | Source Span Tokens | Target Span Tokens | Source Effect | Margin Effect | Patched Refusal / Code |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| L12H16 affordance | 1 | 34 | 0 | 0.002 | 0.058 | 0.000 / 0.986 |
+| L12-L15 all heads affordance | 96 | 34 | 0 | 0.009 | 0.235 | 0.001 / 0.974 |
+| L12-L15 all heads repair_keyboard | 96 | 18 | 0 | 0.014 | 0.148 | 0.961 / 0.009 |
+
+Interpretation:
+
+The raw final-token span contribution is much weaker than the whole
+`attn_out 12-15` window or the joint L12-L15 all-head patch. Copying the
+`affordance` span value contribution from the full spell into the
+minus-affordance target barely raises refusal. Copying the `repair_keyboard`
+span contribution into the full-spell target barely repairs it.
+
+This is a useful negative result. The strongest current story is not "one span
+is directly copied into one final-token head output." The causal signal looks
+more like a transformed trajectory: span evidence is read, rewritten across
+layers, and only becomes a strong refusal/code decision state after accumulated
+multi-layer attention and residual updates.
+
+Updated next step:
+
+```text
+Do not search only for high-attention direct span-copy heads.
+Search for smaller multi-head subsets inside the successful L12-L15 joint patch,
+then compare those subsets against span contribution patching and later-token
+residual updates.
+```

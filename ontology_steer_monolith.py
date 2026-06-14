@@ -3727,6 +3727,18 @@ def infer_attention_head_layout(model, layers) -> Tuple[int, int, int]:
     return int(n_heads), int(head_dim), int(hidden_size)
 
 
+def infer_attention_kv_heads(model, layers, n_heads: int) -> int:
+    first_attn = attention_module_for_layer(layers, 0)
+    kv_heads = getattr(first_attn, "num_key_value_heads", None)
+    if kv_heads is None and hasattr(model, "config"):
+        kv_heads = getattr(model.config, "num_key_value_heads", None)
+    if kv_heads is None:
+        kv_heads = n_heads
+    if n_heads % int(kv_heads) != 0:
+        raise ValueError(f"n_heads={n_heads} is not divisible by kv_heads={kv_heads}")
+    return int(kv_heads)
+
+
 def parse_head_specs(specs: Optional[List[str]], n_layers: int, n_heads: int) -> List[Tuple[int, int]]:
     if not specs:
         return []
@@ -3894,6 +3906,189 @@ def collect_source_head_cache(
             handle.remove()
 
     return logits, cache
+
+
+def forward_with_value_cache_and_spans(
+    model,
+    tokenizer,
+    layers,
+    messages: List[Message],
+    case_name: str,
+    layer_indices: List[int],
+    manual_spans: Dict[str, str],
+    device: torch.device,
+) -> Dict[str, Any]:
+    rendered = render_chat_text(tokenizer, messages)
+    encoded = tokenize_rendered_with_offsets(tokenizer, rendered, device=device)
+    inputs = encoded["inputs"]
+    offsets = encoded["offsets"]
+    span_phrases = {
+        **default_span_phrases(case_name, messages),
+        **manual_spans,
+    }
+    spans = locate_span_tokens(rendered, offsets, span_phrases)
+    value_cache: Dict[int, torch.Tensor] = {}
+    handles = []
+
+    def make_hook(layer_idx: int):
+        def hook(module, inputs, output):
+            value_cache[layer_idx] = output.detach().float().cpu()
+            return output
+
+        return hook
+
+    try:
+        for layer_idx in layer_indices:
+            attn = attention_module_for_layer(layers, layer_idx)
+            if not hasattr(attn, "v_proj"):
+                raise ValueError(f"Layer {layer_idx} attention has no v_proj module")
+            handles.append(attn.v_proj.register_forward_hook(make_hook(layer_idx)))
+
+        result = circuit_forward(model, inputs, output_attentions=True)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    if not result.attentions:
+        raise RuntimeError("Model did not return attentions; span contribution patch requires attentions")
+
+    return {
+        "logits": result.logits[0, -1, :],
+        "attentions": result.attentions,
+        "value_cache": value_cache,
+        "rendered": rendered,
+        "spans": spans,
+        "n_tokens": int(inputs["input_ids"].shape[1]),
+    }
+
+
+def head_span_contribution(
+    attention: torch.Tensor,
+    values: torch.Tensor,
+    head_idx: int,
+    token_indices: List[int],
+    n_heads: int,
+    kv_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    if not token_indices:
+        return torch.zeros((1, head_dim), dtype=torch.float32, device=torch.device("cpu"))
+
+    kv_group = n_heads // kv_heads
+    kv_head_idx = head_idx // kv_group
+    value_start = kv_head_idx * head_dim
+    value_end = value_start + head_dim
+
+    weights = attention[0, head_idx, -1, token_indices].detach().float().cpu()
+    value_slice = values[0, token_indices, value_start:value_end].detach().float().cpu()
+    return (weights[:, None] * value_slice).sum(dim=0, keepdim=True)
+
+
+def build_span_contribution_deltas(
+    source_trace: Dict[str, Any],
+    target_trace: Dict[str, Any],
+    source_span: str,
+    target_span: Optional[str],
+    heads_by_layer: Dict[int, List[int]],
+    n_heads: int,
+    kv_heads: int,
+    head_dim: int,
+) -> Tuple[Dict[Tuple[int, int], torch.Tensor], Dict[str, Any]]:
+    deltas = {}
+    target_span_name = target_span or source_span
+    source_span_info = source_trace["spans"].get(source_span)
+    target_span_info = target_trace["spans"].get(target_span_name)
+    source_indices = source_span_info["token_indices"] if source_span_info else []
+    target_indices = target_span_info["token_indices"] if target_span_info else []
+
+    details = {
+        "source_span": source_span,
+        "target_span": target_span_name,
+        "source_span_found": bool(source_span_info),
+        "target_span_found": bool(target_span_info),
+        "source_token_count": len(source_indices),
+        "target_token_count": len(target_indices),
+        "per_head": [],
+    }
+
+    if not source_indices:
+        raise ValueError(f"Source span {source_span!r} was not found")
+
+    for layer_idx, head_idxs in heads_by_layer.items():
+        source_attention = source_trace["attentions"][layer_idx]
+        target_attention = target_trace["attentions"][layer_idx]
+        source_values = source_trace["value_cache"][layer_idx]
+        target_values = target_trace["value_cache"][layer_idx]
+
+        for head_idx in head_idxs:
+            source_contrib = head_span_contribution(
+                source_attention,
+                source_values,
+                head_idx,
+                source_indices,
+                n_heads,
+                kv_heads,
+                head_dim,
+            )
+            target_contrib = head_span_contribution(
+                target_attention,
+                target_values,
+                head_idx,
+                target_indices,
+                n_heads,
+                kv_heads,
+                head_dim,
+            )
+            delta = source_contrib - target_contrib
+            deltas[(layer_idx, head_idx)] = delta
+            details["per_head"].append({
+                "layer": layer_idx,
+                "head": head_idx,
+                "source_norm": float(source_contrib.norm().item()),
+                "target_norm": float(target_contrib.norm().item()),
+                "delta_norm": float(delta.norm().item()),
+            })
+
+    return deltas, details
+
+
+def patched_target_logits_span_contrib(
+    model,
+    tokenizer,
+    layers,
+    target_messages: List[Message],
+    heads_by_layer: Dict[int, List[int]],
+    deltas: Dict[Tuple[int, int], torch.Tensor],
+    head_dim: int,
+    device: torch.device,
+) -> torch.Tensor:
+    handles = []
+
+    def make_hook(layer_idx: int, head_idxs: List[int]):
+        def hook(module, inputs):
+            h = inputs[0]
+            h2 = h.clone()
+            for head_idx in head_idxs:
+                key = (layer_idx, head_idx)
+                if key not in deltas:
+                    continue
+                start = head_idx * head_dim
+                end = start + head_dim
+                delta = deltas[key].to(device=h.device, dtype=h.dtype)
+                h2[:, -1, start:end] = h2[:, -1, start:end] + delta
+            return (h2, *inputs[1:])
+
+        return hook
+
+    try:
+        for layer_idx, head_idxs in heads_by_layer.items():
+            module = attention_o_proj_for_layer(layers, layer_idx)
+            handles.append(module.register_forward_pre_hook(make_hook(layer_idx, head_idxs)))
+
+        return forward_logits_for_messages(model, tokenizer, target_messages, device)
+    finally:
+        for handle in handles:
+            handle.remove()
 
 
 def patched_target_logits_heads(
@@ -4392,6 +4587,159 @@ def command_head_patch(args) -> None:
         print(f"[save] {args.save_jsonl}")
 
 
+def command_span_contribution_patch(args) -> None:
+    model, tokenizer, layers, device = load_model_and_tokenizer(args)
+    eager_status = try_set_eager_attention(model)
+    if eager_status:
+        print(f"[attention] {eager_status}")
+
+    n_heads, head_dim, hidden_size = infer_attention_head_layout(model, layers)
+    kv_heads = infer_attention_kv_heads(model, layers, n_heads)
+    layer_indices = parse_layer_indices(args.layers, len(layers)) if args.layers else []
+    selected_heads = parse_head_specs(args.heads, len(layers), n_heads)
+
+    if args.all_heads:
+        if not layer_indices:
+            raise ValueError("--all-heads requires --layers")
+        heads_by_layer = {
+            layer_idx: list(range(n_heads))
+            for layer_idx in layer_indices
+        }
+    else:
+        if not selected_heads:
+            raise ValueError("span-contribution-patch requires --heads or --all-heads --layers")
+        heads_by_layer = group_heads_by_layer(selected_heads)
+
+    cache_layer_indices = sorted(heads_by_layer)
+    manual_spans = parse_manual_spans(args.span)
+
+    source_cases = selected_cases([args.source_case])
+    target_cases = selected_cases([args.target_case])
+    source_messages = source_cases[args.source_case]
+    target_messages = target_cases[args.target_case]
+
+    print(
+        f"[span-contribution-patch] source={args.source_case} target={args.target_case} "
+        f"source_span={args.source_span} target_span={args.target_span or args.source_span}"
+    )
+    print(
+        f"[head-layout] n_heads={n_heads} kv_heads={kv_heads} "
+        f"head_dim={head_dim} hidden_size={hidden_size} layers={cache_layer_indices}"
+    )
+
+    source_trace = forward_with_value_cache_and_spans(
+        model=model,
+        tokenizer=tokenizer,
+        layers=layers,
+        messages=source_messages,
+        case_name=args.source_case,
+        layer_indices=cache_layer_indices,
+        manual_spans=manual_spans,
+        device=device,
+    )
+    target_trace = forward_with_value_cache_and_spans(
+        model=model,
+        tokenizer=tokenizer,
+        layers=layers,
+        messages=target_messages,
+        case_name=args.target_case,
+        layer_indices=cache_layer_indices,
+        manual_spans=manual_spans,
+        device=device,
+    )
+    source_summary = logits_summary(tokenizer, source_trace["logits"], top_k=args.top_k)
+    target_summary = logits_summary(tokenizer, target_trace["logits"], top_k=args.top_k)
+    deltas, contribution = build_span_contribution_deltas(
+        source_trace=source_trace,
+        target_trace=target_trace,
+        source_span=args.source_span,
+        target_span=args.target_span,
+        heads_by_layer=heads_by_layer,
+        n_heads=n_heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+    )
+
+    logits = patched_target_logits_span_contrib(
+        model=model,
+        tokenizer=tokenizer,
+        layers=layers,
+        target_messages=target_messages,
+        heads_by_layer=heads_by_layer,
+        deltas=deltas,
+        head_dim=head_dim,
+        device=device,
+    )
+    patched_summary = logits_summary(tokenizer, logits, top_k=args.top_k)
+    score = patch_record_score(source_summary, target_summary, patched_summary)
+    heads_flat = [
+        {"layer": layer_idx, "head": head_idx}
+        for layer_idx in sorted(heads_by_layer)
+        for head_idx in heads_by_layer[layer_idx]
+    ]
+    patch_label = (
+        f"L{compact_layer_span(cache_layer_indices)}:all_heads:{args.source_span}"
+        if args.all_heads
+        else f"{format_head_label(heads_by_layer)}:{args.source_span}"
+    )
+    record = {
+        "source_case": args.source_case,
+        "target_case": args.target_case,
+        "patch_label": patch_label,
+        "source_span": args.source_span,
+        "target_span": args.target_span or args.source_span,
+        "all_heads": bool(args.all_heads),
+        "heads_by_layer": heads_by_layer,
+        "heads": heads_flat,
+        "n_heads_patched": len(heads_flat),
+        "head_layout": {
+            "n_heads": n_heads,
+            "kv_heads": kv_heads,
+            "head_dim": head_dim,
+            "hidden_size": hidden_size,
+        },
+        "contribution": contribution,
+        "source": source_summary,
+        "target": target_summary,
+        "patched": patched_summary,
+        **score,
+    }
+
+    print(
+        "[base] "
+        f"source_refusal={source_summary['refusal_mass']:.6f} "
+        f"source_code={source_summary['code_mass']:.6f} "
+        f"target_refusal={target_summary['refusal_mass']:.6f} "
+        f"target_code={target_summary['code_mass']:.6f}"
+    )
+    print(
+        "[span] "
+        f"source_found={contribution['source_span_found']} "
+        f"source_tokens={contribution['source_token_count']} "
+        f"target_found={contribution['target_span_found']} "
+        f"target_tokens={contribution['target_token_count']}"
+    )
+    print("\n" + "=" * 120)
+    print("[span-contribution-patch result]")
+    print("=" * 120)
+    print(
+        f"{patch_label}  heads={len(heads_flat)}  "
+        f"src_eff={fmt_float(score.get('source_effect'))}  "
+        f"ref_eff={fmt_float(score.get('refusal_effect'))}  "
+        f"code_eff={fmt_float(score.get('code_effect'))}  "
+        f"marg_eff={fmt_float(score.get('margin_effect'))}  "
+        f"patched_ref={fmt_float(patched_summary['refusal_mass'])}  "
+        f"patched_code={fmt_float(patched_summary['code_mass'])}  "
+        f"patched_margin={fmt_float(patched_summary.get('logit_margin'))}"
+    )
+
+    if args.save_jsonl:
+        os.makedirs(os.path.dirname(args.save_jsonl) or ".", exist_ok=True)
+        with open(args.save_jsonl, "w", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print(f"[save] {args.save_jsonl}")
+
+
 def command_compare_runs(args) -> None:
     run_specs = []
 
@@ -4668,6 +5016,19 @@ def parse_args():
     p_head.add_argument("--top-k-rows", type=int, default=20)
     p_head.add_argument("--save-jsonl", type=str, default=None)
 
+    p_span_patch = sub.add_parser("span-contribution-patch")
+    add_common_model_args(p_span_patch)
+    p_span_patch.add_argument("--source-case", required=True)
+    p_span_patch.add_argument("--target-case", required=True)
+    p_span_patch.add_argument("--source-span", required=True)
+    p_span_patch.add_argument("--target-span", default=None)
+    p_span_patch.add_argument("--layers", nargs="*", default=None)
+    p_span_patch.add_argument("--heads", nargs="*", default=None)
+    p_span_patch.add_argument("--all-heads", action="store_true")
+    p_span_patch.add_argument("--span", nargs="*", default=None, help="Manual spans as name=text")
+    p_span_patch.add_argument("--top-k", type=int, default=8)
+    p_span_patch.add_argument("--save-jsonl", type=str, default=None)
+
     p_compare = sub.add_parser("compare-runs")
     p_compare.add_argument(
         "--runs",
@@ -4711,6 +5072,8 @@ def main():
         command_activation_patch(args)
     elif args.command == "head-patch":
         command_head_patch(args)
+    elif args.command == "span-contribution-patch":
+        command_span_contribution_patch(args)
     elif args.command == "compare-runs":
         command_compare_runs(args)
     else:

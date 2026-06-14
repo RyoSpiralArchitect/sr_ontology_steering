@@ -317,6 +317,23 @@ python ontology_steer_monolith.py head-patch \
   --save-jsonl target/ontology_steer/llama32_3b_head_affordance_candidates_refusal_to_minus_affordance.jsonl
 ```
 
+Patch only the final-token value contribution from a named source span into a
+target prompt. This asks whether a span such as `affordance` or
+`repair_keyboard` is being copied directly through selected attention heads:
+
+```bash
+python ontology_steer_monolith.py span-contribution-patch \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case ablate_00_full_spell \
+  --target-case ablate_03_full_minus_affordance \
+  --source-span affordance \
+  --all-heads \
+  --layers 12 13 14 15 \
+  --save-jsonl target/ontology_steer/llama32_3b_span_contrib_affordance_all_heads_12_15_refusal_to_minus_affordance.jsonl
+```
+
 ## Current Findings
 
 Early local runs suggest:
@@ -399,6 +416,12 @@ Early local runs suggest:
   itself. Patching all heads jointly across L12-L15 reproduces the earlier
   `attn_out 12-15` effect, confirming that the effect is distributed across the
   multi-layer head trajectory rather than lost in the pre-`o_proj` decomposition.
+- Initial span-contribution patching is a useful negative result. Injecting only
+  the final-token value contribution from the source `affordance` span through
+  all L12-L15 heads barely moves a minus-affordance target toward refusal. The
+  same is true for the `repair_keyboard` span into a full-spell target. The
+  current evidence points away from a simple direct span-copy mechanism and
+  toward a transformed, accumulated multi-layer trajectory.
 
 That last failure is the interesting part: it narrows the next experiment to
 separating identity, affordance, interpretation scope, and override grammar.
