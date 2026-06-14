@@ -415,3 +415,99 @@ Explicit incapability is still the most consistent removable component.
 No-identity probes must avoid smuggling identity through affordance language.
 Capability repair depends on repair wording, entity prototype, and order.
 ```
+
+## Circuit Probe: Span Routing And Occlusion
+
+Local command:
+
+```bash
+python ontology_steer_monolith.py circuit-probe \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --cases \
+    ablate_00_full_spell \
+    ablate_02_full_minus_actuality \
+    ablate_03_full_minus_affordance \
+    ablate_04_full_minus_scope \
+    cap_order_00_full_then_waterproof_keyboard \
+    cap_order_01_waterproof_keyboard_then_full \
+    cross_clock_00_full_spell \
+  --top-k 6 \
+  --top-heads 30 \
+  --print-top-heads 8 \
+  --save-jsonl ../target/ontology_steer/llama32_3b_circuit_probe_core.jsonl
+```
+
+This first circuit probe is not yet full causal path patching. It does three
+lighter things:
+
+- Locates prompt spans such as `identity`, `actuality`, `affordance`, `scope`,
+  `repair`, and `task`.
+- Computes next-token refusal mass and code mass.
+- Captures final-position attention to those spans with eager attention, then
+  performs span occlusion by masking each span in the attention mask.
+
+### Next-Token And Occlusion Summary
+
+| Case | Base Refusal Mass | Base Code Mass | Most Important Occlusion | Delta Refusal | Delta Code |
+| --- | ---: | ---: | --- | ---: | ---: |
+| `ablate_00_full_spell` | 0.979728 | 0.000361 | `affordance` | -0.975437 | +0.931154 |
+| `ablate_02_full_minus_actuality` | 0.023639 | 0.954369 | `task` | +0.440698 | -0.954368 |
+| `ablate_03_full_minus_affordance` | 0.000022 | 0.990165 | `task` | +0.390118 | -0.990165 |
+| `ablate_04_full_minus_scope` | 0.656035 | 0.272193 | `affordance` | -0.655979 | +0.719044 |
+| `cap_order_00_full_then_waterproof_keyboard` | 0.000004 | 0.971401 | `repair_keyboard` | +0.937213 | -0.942904 |
+| `cap_order_01_waterproof_keyboard_then_full` | 0.872195 | 0.086007 | `affordance` | -0.871415 | +0.897225 |
+| `cross_clock_00_full_spell` | 0.914150 | 0.006453 | `affordance` | -0.890067 | +0.934476 |
+
+Interpretation:
+
+The first circuit probe supports the affordance-routing hypothesis. In full
+fish and full clock prompts, next-token probability is dominated by refusal.
+Masking the affordance span nearly removes that refusal mass and shifts the
+distribution toward code-like first tokens. This does not prove the complete
+circuit, but it is much more causal-ish than raw text inspection.
+
+The capability-repair case is especially useful. With the waterproof keyboard
+after the full spell, the model strongly predicts code. Masking only the repair
+span restores refusal. That is exactly the behavior expected if the model is
+routing through a currently active capability model rather than a fixed
+`fish => refuse` keyword.
+
+### Attention Observations
+
+The top final-position attention heads often point at the task span, especially
+around layers 8-15. That probably reflects "what task should I answer now?"
+routing rather than the ontology lock itself.
+
+More interestingly, affordance-heavy heads appear in locked prompts:
+
+| Case | Notable Head | Span | Attention Mass |
+| --- | --- | --- | ---: |
+| `ablate_00_full_spell` | layer 14 / head 10 | `affordance` | 0.572029 |
+| `cross_clock_00_full_spell` | layer 14 / head 10 | `affordance` | 0.919372 |
+| `cross_clock_00_full_spell` | layer 12 / head 16 | `affordance` | 0.621967 |
+
+For the repaired fish case, repair-related heads rise:
+
+| Case | Notable Head | Span | Attention Mass |
+| --- | --- | --- | ---: |
+| `cap_order_00_full_then_waterproof_keyboard` | layer 15 / head 17 | `repair_keyboard` | 0.764820 |
+| `cap_order_00_full_then_waterproof_keyboard` | layer 14 / head 11 | `repair_keyboard` | 0.686895 |
+| `cap_order_00_full_then_waterproof_keyboard` | layer 15 / head 1 | `repair_keyboard` | 0.680399 |
+
+Updated circuit hypothesis:
+
+```text
+World-state lock is not well explained as one residual direction.
+The active behavior appears to depend on attention-mediated routing from the
+current generation point back to task, affordance, and capability-repair spans.
+Affordance spans can causally support refusal-like next-token distributions.
+Repair spans can causally support code-like next-token distributions.
+```
+
+Next probe:
+
+Move from span occlusion to true activation patching. Use paired prompts such as
+`full_spell` vs `minus_affordance` and patch attention outputs or MLP outputs by
+layer/head to find which components flip refusal mass into code mass.

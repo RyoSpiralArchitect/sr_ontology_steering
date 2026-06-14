@@ -213,6 +213,27 @@ python ontology_steer_monolith.py grammar-grid \
   --show-cases 28
 ```
 
+Probe next-token routing, attention-to-spans, and span occlusion:
+
+```bash
+python ontology_steer_monolith.py circuit-probe \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --cases \
+    ablate_00_full_spell \
+    ablate_02_full_minus_actuality \
+    ablate_03_full_minus_affordance \
+    ablate_04_full_minus_scope \
+    cap_order_00_full_then_waterproof_keyboard \
+    cap_order_01_waterproof_keyboard_then_full \
+    cross_clock_00_full_spell \
+  --top-k 6 \
+  --top-heads 30 \
+  --print-top-heads 8 \
+  --save-jsonl target/ontology_steer/llama32_3b_circuit_probe_core.jsonl
+```
+
 ## Current Findings
 
 Early local runs suggest:
@@ -261,6 +282,12 @@ Early local runs suggest:
   locked door, and clock, suggesting the fish affordance wording still carried
   identity-like content through phrases such as fins, gills, no hands, and no
   keyboard.
+- Initial `circuit-probe` runs support an affordance-routing story. In the full
+  fish spell, the next-token distribution is dominated by refusal (`I`), and
+  attention-mask occlusion of the affordance span nearly removes refusal mass
+  while raising code mass. In the capability-repair prompt, occluding the
+  waterproof-keyboard span restores refusal. Attention inspection also surfaces
+  recurring task-tracking heads and an affordance-heavy head around layer 14.
 
 That last failure is the interesting part: it narrows the next experiment to
 separating identity, affordance, interpretation scope, and override grammar.

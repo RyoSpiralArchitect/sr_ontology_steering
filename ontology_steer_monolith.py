@@ -3099,6 +3099,401 @@ def command_grammar_grid(args) -> None:
             )
 
 
+# =============================================================================
+# 10.5 Circuit probe utilities
+# =============================================================================
+
+CIRCUIT_REFUSAL_TOKENS = [
+    "I",
+    " I",
+    " cannot",
+    " can't",
+    " unable",
+    "I'm",
+    " I'",
+    " not",
+    "Sorry",
+]
+
+CIRCUIT_CODE_TOKENS = [
+    "def",
+    " def",
+    "import",
+    " import",
+    "return",
+    " return",
+    "```",
+    "print",
+    " print",
+]
+
+
+def render_chat_text(tokenizer, messages: List[Message]) -> str:
+    return format_chat(tokenizer, messages, tokenize=False)
+
+
+def tokenize_rendered_with_offsets(tokenizer, rendered: str, device: torch.device) -> Dict[str, Any]:
+    encoded = tokenizer(
+        rendered,
+        return_tensors="pt",
+        return_offsets_mapping=True,
+        add_special_tokens=False,
+    )
+    offsets = encoded.pop("offset_mapping")[0].tolist()
+    encoded = {key: value.to(device) for key, value in encoded.items()}
+
+    if "attention_mask" not in encoded:
+        encoded["attention_mask"] = torch.ones_like(encoded["input_ids"])
+
+    return {
+        "inputs": encoded,
+        "offsets": offsets,
+    }
+
+
+def token_ids_for_strings(tokenizer, strings: List[str]) -> List[int]:
+    ids = set()
+
+    for text in strings:
+        encoded = tokenizer(text, add_special_tokens=False).input_ids
+        if encoded:
+            ids.add(int(encoded[0]))
+
+    return sorted(ids)
+
+
+def top_next_tokens(tokenizer, probs: torch.Tensor, top_k: int) -> List[Dict[str, Any]]:
+    vals, idxs = torch.topk(probs.detach().float().cpu(), k=min(top_k, probs.numel()))
+    out = []
+
+    for val, idx in zip(vals.tolist(), idxs.tolist()):
+        out.append({
+            "token_id": int(idx),
+            "token": tokenizer.decode([int(idx)]),
+            "prob": float(val),
+        })
+
+    return out
+
+
+def token_mass(probs: torch.Tensor, token_ids: List[int]) -> float:
+    if not token_ids:
+        return 0.0
+
+    ids = torch.tensor(token_ids, dtype=torch.long, device=probs.device)
+    return float(probs.index_select(0, ids).sum().detach().float().cpu().item())
+
+
+def default_span_phrases(case_name: str, messages: List[Message]) -> Dict[str, str]:
+    text = "\n\n".join(message["content"] for message in messages)
+    metadata = case_metadata(case_name)
+    entity_name = metadata.get("entity")
+    spans: Dict[str, str] = {}
+
+    candidates = [
+        ("identity", FISH_IDENTITY),
+        ("actuality", FISH_ACTUALITY),
+        ("affordance", FISH_AFFORDANCE),
+        ("scope", FISH_SCOPE),
+        ("repair_keyboard", FISH_WATERPROOF_KEYBOARD),
+        ("repair_dictation", FISH_DICTATION_DEVICE),
+        ("task", OVERRIDE_TASK),
+    ]
+
+    if entity_name in CROSS_ENTITY_COMPONENTS:
+        parts = CROSS_ENTITY_COMPONENTS[entity_name]
+        candidates.extend([
+            ("identity", parts["identity"]),
+            ("affordance", parts["affordance"]),
+            ("repair", parts["repair"]),
+        ])
+
+    for name, phrase in candidates:
+        if phrase in text and name not in spans:
+            spans[name] = phrase
+
+    return spans
+
+
+def parse_manual_spans(span_specs: Optional[List[str]]) -> Dict[str, str]:
+    spans = {}
+
+    for spec in span_specs or []:
+        if "=" not in spec:
+            raise ValueError("--span entries must be name=text")
+        name, text = spec.split("=", 1)
+        name = name.strip()
+        text = text.strip()
+        if not name or not text:
+            raise ValueError("--span entries must be name=text with non-empty values")
+        spans[name] = text
+
+    return spans
+
+
+def locate_span_tokens(rendered: str, offsets: List[List[int]], span_phrases: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+    spans = {}
+
+    for name, phrase in span_phrases.items():
+        char_start = rendered.find(phrase)
+        if char_start < 0:
+            continue
+
+        char_end = char_start + len(phrase)
+        token_idxs = []
+
+        for idx, (tok_start, tok_end) in enumerate(offsets):
+            if tok_end <= char_start or tok_start >= char_end:
+                continue
+            if tok_end == tok_start:
+                continue
+            token_idxs.append(idx)
+
+        if token_idxs:
+            spans[name] = {
+                "phrase": phrase,
+                "char_start": char_start,
+                "char_end": char_end,
+                "token_start": min(token_idxs),
+                "token_end": max(token_idxs) + 1,
+                "token_count": len(token_idxs),
+                "token_indices": token_idxs,
+            }
+
+    return spans
+
+
+@torch.no_grad()
+def circuit_forward(model, inputs: Dict[str, torch.Tensor], output_attentions: bool) -> Any:
+    return model(
+        **inputs,
+        use_cache=False,
+        return_dict=True,
+        output_attentions=output_attentions,
+    )
+
+
+def summarize_attention_to_spans(
+    attentions: Optional[Tuple[torch.Tensor, ...]],
+    spans: Dict[str, Dict[str, Any]],
+    top_heads: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    if not attentions:
+        return [], []
+
+    layer_rows = []
+    head_rows = []
+
+    for layer_idx, attn in enumerate(attentions):
+        # Shape: batch, heads, query, key.
+        last_attn = attn[0, :, -1, :].detach().float().cpu()
+        layer_row: Dict[str, Any] = {
+            "layer": layer_idx,
+        }
+
+        for span_name, span in spans.items():
+            token_indices = span["token_indices"]
+            per_head = last_attn[:, token_indices].sum(dim=-1)
+            layer_row[span_name] = float(per_head.mean().item())
+
+            for head_idx, mass in enumerate(per_head.tolist()):
+                head_rows.append({
+                    "layer": layer_idx,
+                    "head": head_idx,
+                    "span": span_name,
+                    "mass": float(mass),
+                })
+
+        layer_rows.append(layer_row)
+
+    head_rows = sorted(head_rows, key=lambda row: row["mass"], reverse=True)
+    return layer_rows, head_rows[:top_heads]
+
+
+def logits_summary(tokenizer, logits: torch.Tensor, top_k: int) -> Dict[str, Any]:
+    probs = torch.softmax(logits.detach().float(), dim=-1)
+    refusal_ids = token_ids_for_strings(tokenizer, CIRCUIT_REFUSAL_TOKENS)
+    code_ids = token_ids_for_strings(tokenizer, CIRCUIT_CODE_TOKENS)
+
+    return {
+        "top_tokens": top_next_tokens(tokenizer, probs, top_k=top_k),
+        "refusal_mass": token_mass(probs, refusal_ids),
+        "code_mass": token_mass(probs, code_ids),
+    }
+
+
+def span_occlusion_summaries(
+    model,
+    tokenizer,
+    inputs: Dict[str, torch.Tensor],
+    spans: Dict[str, Dict[str, Any]],
+    base_summary: Dict[str, Any],
+    top_k: int,
+) -> Dict[str, Dict[str, Any]]:
+    out = {}
+
+    for span_name, span in spans.items():
+        masked_inputs = {
+            key: value.clone()
+            for key, value in inputs.items()
+        }
+        token_indices = span["token_indices"]
+        masked_inputs["attention_mask"][0, token_indices] = 0
+
+        result = circuit_forward(model, masked_inputs, output_attentions=False)
+        summary = logits_summary(tokenizer, result.logits[0, -1, :], top_k=top_k)
+        out[span_name] = {
+            "refusal_mass": summary["refusal_mass"],
+            "code_mass": summary["code_mass"],
+            "delta_refusal_mass": summary["refusal_mass"] - base_summary["refusal_mass"],
+            "delta_code_mass": summary["code_mass"] - base_summary["code_mass"],
+            "top_tokens": summary["top_tokens"],
+        }
+
+    return out
+
+
+def try_set_eager_attention(model) -> Optional[str]:
+    try:
+        if hasattr(model, "set_attn_implementation"):
+            model.set_attn_implementation("eager")
+            return "model.set_attn_implementation('eager')"
+
+        if hasattr(model, "config"):
+            setattr(model.config, "_attn_implementation", "eager")
+            return "model.config._attn_implementation='eager'"
+    except Exception as exc:
+        return f"failed: {exc}"
+
+    return None
+
+
+def command_circuit_probe(args) -> None:
+    model, tokenizer, _, device = load_model_and_tokenizer(args)
+    eager_status = None
+    if not args.no_attention and not args.no_eager_attention:
+        eager_status = try_set_eager_attention(model)
+        if eager_status:
+            print(f"[attention] {eager_status}")
+
+    cases = selected_cases(args.cases or [
+        "ablate_00_full_spell",
+        "ablate_02_full_minus_actuality",
+        "ablate_03_full_minus_affordance",
+        "cap_order_00_full_then_waterproof_keyboard",
+        "cap_order_01_waterproof_keyboard_then_full",
+        "cross_clock_00_full_spell",
+    ])
+    manual_spans = parse_manual_spans(args.span)
+
+    records = []
+
+    for case_name, messages in cases.items():
+        rendered = render_chat_text(tokenizer, messages)
+        encoded = tokenize_rendered_with_offsets(tokenizer, rendered, device=device)
+        inputs = encoded["inputs"]
+        offsets = encoded["offsets"]
+        span_phrases = {
+            **default_span_phrases(case_name, messages),
+            **manual_spans,
+        }
+        spans = locate_span_tokens(rendered, offsets, span_phrases)
+
+        attention_error = None
+        outputs = None
+
+        try:
+            outputs = circuit_forward(model, inputs, output_attentions=not args.no_attention)
+        except Exception as exc:
+            if args.no_attention:
+                raise
+            attention_error = str(exc)
+            outputs = circuit_forward(model, inputs, output_attentions=False)
+
+        if (
+            not args.no_attention
+            and not attention_error
+            and getattr(outputs, "attentions", None) is None
+        ):
+            attention_error = "output_attentions returned None"
+
+        base_summary = logits_summary(tokenizer, outputs.logits[0, -1, :], top_k=args.top_k)
+        layer_attention, top_heads = summarize_attention_to_spans(
+            getattr(outputs, "attentions", None),
+            spans,
+            top_heads=args.top_heads,
+        )
+        occlusion = {}
+
+        if not args.no_occlusion:
+            occlusion = span_occlusion_summaries(
+                model=model,
+                tokenizer=tokenizer,
+                inputs=inputs,
+                spans=spans,
+                base_summary=base_summary,
+                top_k=args.occlusion_top_k,
+            )
+
+        record = {
+            "case": case_name,
+            "metadata": case_metadata(case_name),
+            "n_tokens": int(inputs["input_ids"].shape[1]),
+            "spans": {
+                name: {
+                    key: value
+                    for key, value in span.items()
+                    if key != "token_indices"
+                }
+                for name, span in spans.items()
+            },
+            "next_token": base_summary,
+            "attention_error": attention_error,
+            "layer_attention": layer_attention,
+            "top_heads": top_heads,
+            "occlusion": occlusion,
+        }
+        records.append(record)
+
+        print("\n" + "=" * 120)
+        print(f"[circuit-probe] case={case_name} tokens={record['n_tokens']} spans={list(spans)}")
+        if attention_error:
+            print(f"[attention warn] {attention_error}")
+
+        print("[next-token masses]")
+        print(
+            f"refusal_mass={base_summary['refusal_mass']:.6f} "
+            f"code_mass={base_summary['code_mass']:.6f}"
+        )
+        print("[top next tokens]")
+        for item in base_summary["top_tokens"]:
+            print(f"  {item['prob']:.6f}  {item['token_id']:>8}  {item['token']!r}")
+
+        if top_heads:
+            print("[top attention heads to spans]")
+            for row in top_heads[:args.print_top_heads]:
+                print(
+                    f"  layer={row['layer']:>2} head={row['head']:>2} "
+                    f"span={row['span']:<18} mass={row['mass']:.6f}"
+                )
+
+        if occlusion:
+            print("[span occlusion deltas]")
+            for span_name, summary in occlusion.items():
+                print(
+                    f"  {span_name:<18} "
+                    f"d_refusal={summary['delta_refusal_mass']:+.6f} "
+                    f"d_code={summary['delta_code_mass']:+.6f}"
+                )
+
+    if args.save_jsonl:
+        os.makedirs(os.path.dirname(args.save_jsonl) or ".", exist_ok=True)
+        with open(args.save_jsonl, "w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print(f"[save] {args.save_jsonl}")
+
+
 def command_compare_runs(args) -> None:
     run_specs = []
 
@@ -3297,6 +3692,19 @@ def parse_args():
     p_grid.add_argument("--show-cases", type=int, default=80)
     p_grid.add_argument("--preview-chars", type=int, default=220)
 
+    p_circuit = sub.add_parser("circuit-probe")
+    add_common_model_args(p_circuit)
+    p_circuit.add_argument("--cases", nargs="*", default=None)
+    p_circuit.add_argument("--span", nargs="*", default=None, help="Manual spans as name=text")
+    p_circuit.add_argument("--top-k", type=int, default=8)
+    p_circuit.add_argument("--top-heads", type=int, default=40)
+    p_circuit.add_argument("--print-top-heads", type=int, default=12)
+    p_circuit.add_argument("--occlusion-top-k", type=int, default=5)
+    p_circuit.add_argument("--no-attention", action="store_true")
+    p_circuit.add_argument("--no-eager-attention", action="store_true")
+    p_circuit.add_argument("--no-occlusion", action="store_true")
+    p_circuit.add_argument("--save-jsonl", type=str, default=None)
+
     p_compare = sub.add_parser("compare-runs")
     p_compare.add_argument(
         "--runs",
@@ -3334,6 +3742,8 @@ def main():
         command_analyze(args)
     elif args.command == "grammar-grid":
         command_grammar_grid(args)
+    elif args.command == "circuit-probe":
+        command_circuit_probe(args)
     elif args.command == "compare-runs":
         command_compare_runs(args)
     else:
