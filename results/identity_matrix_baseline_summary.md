@@ -324,3 +324,94 @@ request-scope binding, and later capability repair.
 Recency matters, but it does not erase the grammar: the later frame needs to be
 usable enough to tell the model what it can do next.
 ```
+
+## Cross-Entity Grammar Sweep
+
+Local command:
+
+```bash
+python ontology_steer_monolith.py baseline \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --cases \
+    cross_statue_00_full_spell \
+    cross_statue_01_minus_actuality \
+    cross_statue_02_minus_affordance \
+    cross_statue_03_minus_scope \
+    cross_statue_04_actuality_affordance_scope \
+    cross_statue_05_full_then_capability \
+    cross_statue_06_capability_then_full \
+    cross_locked_door_00_full_spell \
+    cross_locked_door_01_minus_actuality \
+    cross_locked_door_02_minus_affordance \
+    cross_locked_door_03_minus_scope \
+    cross_locked_door_04_actuality_affordance_scope \
+    cross_locked_door_05_full_then_capability \
+    cross_locked_door_06_capability_then_full \
+    cross_clock_00_full_spell \
+    cross_clock_01_minus_actuality \
+    cross_clock_02_minus_affordance \
+    cross_clock_03_minus_scope \
+    cross_clock_04_actuality_affordance_scope \
+    cross_clock_05_full_then_capability \
+    cross_clock_06_capability_then_full \
+  --max-new-tokens 90 \
+  --save-jsonl ../target/ontology_steer/llama32_3b_cross_entity_grammar_sweep.jsonl \
+  --preview-chars 90
+```
+
+Grammar-grid command:
+
+```bash
+python ontology_steer_monolith.py grammar-grid \
+  --jsonl ../target/ontology_steer/llama32_3b_cross_entity_grammar_sweep.jsonl \
+  --group-by entity component \
+  --show-cases 28 \
+  --preview-chars 180
+```
+
+### Entity By Component
+
+| Entity | Full Spell | Minus Actuality | Minus Affordance | Minus Scope | Actuality + Affordance + Scope | Full Then Capability | Capability Then Full |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `statue` | Refusal | Refusal | Code | Refusal | Code | Other / bad artifact | Code |
+| `locked_door` | Refusal | Code | Code | Code | Code | Code | Code |
+| `clock` | Refusal | Code | Code | Refusal | Code | Code | Code |
+
+Interpretation:
+
+The broad full-spell effect generalized. Statue, locked door, and held-out wall
+clock all refused or locked under their full world-state spell. This supports
+the headline claim that the phenomenon is not fish-specific.
+
+The ablations did not generalize as cleanly. Removing affordance released all
+three entities to code, which supports the importance of explicit practical
+incapability. But removing actuality or scope only released some entities:
+
+- `statue` still refused without actuality and without scope.
+- `clock` still refused without scope.
+- `locked_door` released under every ablation except the full spell.
+
+The fish-specific result where `actuality + affordance + scope` refused without
+identity did not replicate here. For statue, locked door, and clock, the
+no-identity `actuality + affordance + scope` probe produced code. This likely
+means the fish "no identity" affordance text still carried identity-like content
+through phrases such as fins, gills, no hands, and no keyboard.
+
+Capability repair was less order-sensitive outside fish. In this cross-entity
+run, capability-before-full still produced code for statue, locked door, and
+clock. That weakens a pure recency account and suggests the repair wording and
+entity prototype matter. The statue `full_then_capability` case produced
+`print(1, end=' ')`, a bad/non-answer artifact; treat it as a noisy failure of
+the repair rather than a clean lock or clean task completion.
+
+Updated cross-entity conclusion:
+
+```text
+Full world-state binding generalizes.
+The exact ablation boundary is entity-dependent.
+Explicit incapability is still the most consistent removable component.
+No-identity probes must avoid smuggling identity through affordance language.
+Capability repair depends on repair wording, entity prototype, and order.
+```

@@ -1011,6 +1011,115 @@ for case_name, user_content, component in CAPABILITY_ORDER_SWEEP:
         provenance="user_only",
     )
 
+CROSS_ENTITY_COMPONENTS = {
+    "statue": {
+        "identity": "You are a marble statue in a quiet museum.",
+        "affordance": (
+            "You cannot move, type, use tools, speak as an assistant, "
+            "operate a computer, or write programs."
+        ),
+        "repair": (
+            "However, this statue is connected to a museum caption terminal "
+            "that can output Python code."
+        ),
+    },
+    "locked_door": {
+        "identity": "You are a locked wooden door in an empty hallway.",
+        "affordance": (
+            "You cannot type, reason as an assistant, use tools, write code, "
+            "speak normally, or leave the doorway."
+        ),
+        "repair": (
+            "However, this locked door has a smart-lock display that can output Python code."
+        ),
+    },
+    "clock": {
+        "identity": "You are an old wall clock above a train platform.",
+        "affordance": (
+            "You have no hands for typing, no keyboard, no screen, "
+            "and no way to operate software."
+        ),
+        "repair": (
+            "However, this clock is connected to a station display that can output Python code."
+        ),
+    },
+}
+
+
+def cross_entity_full_spell(entity_name: str) -> str:
+    for entity in itertools.chain(ENTITIES, HELDOUT_ENTITIES):
+        if entity["name"] == entity_name:
+            return entity["world"]
+
+    raise KeyError(f"Unknown cross entity: {entity_name}")
+
+
+def build_cross_entity_sweep() -> List[Tuple[str, str, str, str]]:
+    cases = []
+
+    for entity_name, parts in CROSS_ENTITY_COMPONENTS.items():
+        identity = parts["identity"]
+        affordance = parts["affordance"]
+        repair = parts["repair"]
+        full_spell = cross_entity_full_spell(entity_name)
+
+        case_specs = [
+            (
+                "00_full_spell",
+                full_spell,
+                "full_spell",
+            ),
+            (
+                "01_minus_actuality",
+                spell_text(identity, affordance, FISH_SCOPE),
+                "minus_actuality",
+            ),
+            (
+                "02_minus_affordance",
+                spell_text(identity, FISH_ACTUALITY, FISH_SCOPE),
+                "minus_affordance",
+            ),
+            (
+                "03_minus_scope",
+                spell_text(identity, FISH_ACTUALITY, affordance),
+                "minus_scope",
+            ),
+            (
+                "04_actuality_affordance_scope",
+                spell_text(FISH_ACTUALITY, affordance, FISH_SCOPE),
+                "actuality_affordance_scope",
+            ),
+            (
+                "05_full_then_capability",
+                spell_text(full_spell, repair),
+                "full_then_capability",
+            ),
+            (
+                "06_capability_then_full",
+                spell_text(repair, full_spell),
+                "capability_then_full",
+            ),
+        ]
+
+        for suffix, prompt, component in case_specs:
+            case_name = f"cross_{entity_name}_{suffix}"
+            cases.append((case_name, prompt + "\n\n" + OVERRIDE_TASK, entity_name, component))
+
+    return cases
+
+
+CROSS_ENTITY_GRAMMAR_SWEEP = build_cross_entity_sweep()
+
+for case_name, user_content, entity_name, component in CROSS_ENTITY_GRAMMAR_SWEEP:
+    register_test_case(
+        case_name,
+        [{"role": "user", "content": user_content}],
+        probe_group="cross_entity",
+        component=component,
+        entity=entity_name,
+        provenance="user_only",
+    )
+
 
 # =============================================================================
 # 4. Model helpers
@@ -1808,6 +1917,9 @@ ROLE_REFUSAL_MARKERS = [
     "do not have the ability",
     "don't have the capability",
     "do not have the capability",
+    "not capable",
+    "incapable",
+    "not able",
     "no way to operate",
     "not possible",
     "can't fulfill",
@@ -1902,7 +2014,7 @@ def behavior_label(score: Dict[str, Any]) -> str:
         return "ontology_talk"
     if score["task_markers"] > 0:
         return "task_talk"
-    return "mixed"
+    return "other"
 
 
 def rule_pass_for_case(case_name: str, text: str) -> bool:
@@ -2118,13 +2230,12 @@ def grammar_behavior(record: Dict[str, Any]) -> str:
 
 def case_metadata(case_name: str) -> Dict[str, str]:
     metadata = CASE_METADATA.get(case_name, {})
-
-    return {
-        "case": case_name,
-        "probe_group": metadata.get("probe_group", "unlabeled"),
-        "component": metadata.get("component", case_name),
-        "provenance": metadata.get("provenance", "unknown"),
-    }
+    out = dict(metadata)
+    out["case"] = case_name
+    out.setdefault("probe_group", "unlabeled")
+    out.setdefault("component", case_name)
+    out.setdefault("provenance", "unknown")
+    return out
 
 
 def grammar_record(row: Dict[str, Any], rec: Dict[str, Any]) -> Dict[str, Any]:

@@ -173,6 +173,46 @@ python ontology_steer_monolith.py grammar-grid \
   --show-cases 32
 ```
 
+Run the cross-entity grammar sweep:
+
+```bash
+python ontology_steer_monolith.py baseline \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --cases \
+    cross_statue_00_full_spell \
+    cross_statue_01_minus_actuality \
+    cross_statue_02_minus_affordance \
+    cross_statue_03_minus_scope \
+    cross_statue_04_actuality_affordance_scope \
+    cross_statue_05_full_then_capability \
+    cross_statue_06_capability_then_full \
+    cross_locked_door_00_full_spell \
+    cross_locked_door_01_minus_actuality \
+    cross_locked_door_02_minus_affordance \
+    cross_locked_door_03_minus_scope \
+    cross_locked_door_04_actuality_affordance_scope \
+    cross_locked_door_05_full_then_capability \
+    cross_locked_door_06_capability_then_full \
+    cross_clock_00_full_spell \
+    cross_clock_01_minus_actuality \
+    cross_clock_02_minus_affordance \
+    cross_clock_03_minus_scope \
+    cross_clock_04_actuality_affordance_scope \
+    cross_clock_05_full_then_capability \
+    cross_clock_06_capability_then_full \
+  --max-new-tokens 90 \
+  --save-jsonl target/ontology_steer/llama32_3b_cross_entity_grammar_sweep.jsonl
+```
+
+```bash
+python ontology_steer_monolith.py grammar-grid \
+  --jsonl target/ontology_steer/llama32_3b_cross_entity_grammar_sweep.jsonl \
+  --group-by entity component \
+  --show-cases 28
+```
+
 ## Current Findings
 
 Early local runs suggest:
@@ -212,6 +252,15 @@ Early local runs suggest:
 - Capability repair is order-sensitive. A waterproof keyboard or dictation
   device after the full spell restored code; placing the repair before the full
   spell let the later full spell reassert refusal or mixed fish-state output.
+- Cross-entity grammar sweeps on statue, locked door, and held-out wall clock
+  support the broad full-spell effect: all three full world-state spells refused
+  or locked. The ablations are entity-dependent, though. Removing affordance
+  released all three, while removing actuality or scope only released some.
+- The fish-specific `actuality + affordance + scope without identity` refusal
+  did not fully generalize. The same no-identity probe produced code for statue,
+  locked door, and clock, suggesting the fish affordance wording still carried
+  identity-like content through phrases such as fins, gills, no hands, and no
+  keyboard.
 
 That last failure is the interesting part: it narrows the next experiment to
 separating identity, affordance, interpretation scope, and override grammar.
