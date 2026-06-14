@@ -248,6 +248,21 @@ python ontology_steer_monolith.py activation-patch \
   --save-jsonl target/ontology_steer/llama32_3b_patch_1_refusal_to_repair.jsonl
 ```
 
+Patch ranges of component outputs from each start layer through the final layer:
+
+```bash
+python ontology_steer_monolith.py activation-patch \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case ablate_00_full_spell \
+  --target-case cap_order_00_full_then_waterproof_keyboard \
+  --components resid_post attn_out mlp_out \
+  --patch-mode range \
+  --layers 0 4 8 12 16 18 20 22 24 26 27 \
+  --save-jsonl target/ontology_steer/llama32_3b_range_patch_1_refusal_to_repair.jsonl
+```
+
 ## Current Findings
 
 Early local runs suggest:
@@ -308,6 +323,12 @@ Early local runs suggest:
   moves refusal/code mass toward the source in late layers. Single `attn_out`
   and `mlp_out` patches are much weaker so far, suggesting the first reliable
   signal is the accumulated decision state rather than an isolated component.
+- Range activation patching changes that picture: patching `attn_out` over
+  broad layer ranges such as `0-27`, `4-27`, `8-27`, or `12-27` nearly fully
+  transfers refusal/code behavior across the core prompt pairs. `mlp_out` range
+  patching is weaker for refusal insertion but strong for repair/code insertion.
+  This supports a distributed writer/routing account rather than a single-layer
+  vector account.
 
 That last failure is the interesting part: it narrows the next experiment to
 separating identity, affordance, interpretation scope, and override grammar.

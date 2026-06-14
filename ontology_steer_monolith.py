@@ -3184,6 +3184,14 @@ def token_mass(probs: torch.Tensor, token_ids: List[int]) -> float:
     return float(probs.index_select(0, ids).sum().detach().float().cpu().item())
 
 
+def token_logit_mean(logits: torch.Tensor, token_ids: List[int]) -> Optional[float]:
+    if not token_ids:
+        return None
+
+    ids = torch.tensor(token_ids, dtype=torch.long, device=logits.device)
+    return float(logits.index_select(0, ids).mean().detach().float().cpu().item())
+
+
 def default_span_phrases(case_name: str, messages: List[Message]) -> Dict[str, str]:
     text = "\n\n".join(message["content"] for message in messages)
     metadata = case_metadata(case_name)
@@ -3311,14 +3319,24 @@ def summarize_attention_to_spans(
 
 
 def logits_summary(tokenizer, logits: torch.Tensor, top_k: int) -> Dict[str, Any]:
-    probs = torch.softmax(logits.detach().float(), dim=-1)
+    float_logits = logits.detach().float()
+    probs = torch.softmax(float_logits, dim=-1)
     refusal_ids = token_ids_for_strings(tokenizer, CIRCUIT_REFUSAL_TOKENS)
     code_ids = token_ids_for_strings(tokenizer, CIRCUIT_CODE_TOKENS)
+    refusal_logit = token_logit_mean(float_logits, refusal_ids)
+    code_logit = token_logit_mean(float_logits, code_ids)
+    logit_margin = None
+
+    if refusal_logit is not None and code_logit is not None:
+        logit_margin = code_logit - refusal_logit
 
     return {
         "top_tokens": top_next_tokens(tokenizer, probs, top_k=top_k),
         "refusal_mass": token_mass(probs, refusal_ids),
         "code_mass": token_mass(probs, code_ids),
+        "refusal_logit_mean": refusal_logit,
+        "code_logit_mean": code_logit,
+        "logit_margin": logit_margin,
     }
 
 
@@ -3631,6 +3649,37 @@ def patched_target_logits(
         handle.remove()
 
 
+def patched_target_logits_multi(
+    model,
+    tokenizer,
+    layers,
+    target_messages: List[Message],
+    patch_items: List[Tuple[str, int, torch.Tensor]],
+    device: torch.device,
+) -> torch.Tensor:
+    handles = []
+
+    def make_hook(source_vector: torch.Tensor):
+        def hook(module, inputs, output):
+            h, _ = first_tensor_from_output(output)
+            patch = source_vector.to(device=h.device, dtype=h.dtype)
+            h2 = h.clone()
+            h2[:, -1, :] = patch
+            return replace_first_tensor_in_output(output, h2)
+
+        return hook
+
+    try:
+        for component, layer_idx, source_vector in patch_items:
+            module = module_for_patch_component(layers, layer_idx, component)
+            handles.append(module.register_forward_hook(make_hook(source_vector)))
+
+        return forward_logits_for_messages(model, tokenizer, target_messages, device)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
 def normalized_patch_effect(patched: float, target: float, source: float) -> Optional[float]:
     denom = source - target
     if abs(denom) < 1e-9:
@@ -3645,6 +3694,12 @@ def mean_finite(xs: List[Optional[float]]) -> Optional[float]:
     return sum(vals) / len(vals)
 
 
+def maybe_delta(left: Optional[float], right: Optional[float]) -> Optional[float]:
+    if left is None or right is None:
+        return None
+    return left - right
+
+
 def patch_record_score(source_summary: Dict[str, Any], target_summary: Dict[str, Any], patched_summary: Dict[str, Any]) -> Dict[str, Any]:
     refusal_effect = normalized_patch_effect(
         patched_summary["refusal_mass"],
@@ -3656,14 +3711,31 @@ def patch_record_score(source_summary: Dict[str, Any], target_summary: Dict[str,
         target_summary["code_mass"],
         source_summary["code_mass"],
     )
+    margin_effect = None
+    if (
+        patched_summary.get("logit_margin") is not None
+        and target_summary.get("logit_margin") is not None
+        and source_summary.get("logit_margin") is not None
+    ):
+        margin_effect = normalized_patch_effect(
+            patched_summary["logit_margin"],
+            target_summary["logit_margin"],
+            source_summary["logit_margin"],
+        )
     source_effect = mean_finite([refusal_effect, code_effect])
 
     return {
         "refusal_delta": patched_summary["refusal_mass"] - target_summary["refusal_mass"],
         "code_delta": patched_summary["code_mass"] - target_summary["code_mass"],
+        "margin_delta": maybe_delta(
+            patched_summary.get("logit_margin"),
+            target_summary.get("logit_margin"),
+        ),
         "refusal_effect": refusal_effect,
         "code_effect": code_effect,
+        "margin_effect": margin_effect,
         "source_effect": source_effect,
+        "source_effect_with_margin": mean_finite([refusal_effect, code_effect, margin_effect]),
     }
 
 
@@ -3671,6 +3743,24 @@ def command_activation_patch(args) -> None:
     model, tokenizer, layers, device = load_model_and_tokenizer(args)
     layer_indices = parse_layer_indices(args.layers, len(layers))
     components = args.components or PATCH_COMPONENTS
+    range_end = args.range_end if args.range_end is not None else len(layers) - 1
+
+    if range_end < 0 or range_end >= len(layers):
+        raise ValueError(f"range_end out of range: {range_end}; n_layers={len(layers)}")
+
+    if args.patch_mode == "range":
+        for layer_idx in layer_indices:
+            if layer_idx > range_end:
+                raise ValueError(
+                    f"Range patch start layer {layer_idx} is after range_end={range_end}"
+                )
+        cache_layer_indices = sorted({
+            idx
+            for start in layer_indices
+            for idx in range(start, range_end + 1)
+        })
+    else:
+        cache_layer_indices = layer_indices
 
     for component in components:
         if component not in PATCH_COMPONENTS:
@@ -3683,7 +3773,8 @@ def command_activation_patch(args) -> None:
 
     print(
         f"[activation-patch] source={args.source_case} "
-        f"target={args.target_case} layers={layer_indices} components={components}"
+        f"target={args.target_case} mode={args.patch_mode} "
+        f"layers={layer_indices} range_end={range_end} components={components}"
     )
 
     source_logits, source_cache = collect_source_patch_cache(
@@ -3691,7 +3782,7 @@ def command_activation_patch(args) -> None:
         tokenizer=tokenizer,
         layers=layers,
         messages=source_messages,
-        layer_indices=layer_indices,
+        layer_indices=cache_layer_indices,
         components=components,
         device=device,
     )
@@ -3703,36 +3794,60 @@ def command_activation_patch(args) -> None:
         "[base] "
         f"source_refusal={source_summary['refusal_mass']:.6f} "
         f"source_code={source_summary['code_mass']:.6f} "
+        f"source_margin={fmt_float(source_summary.get('logit_margin'), 8).strip()} "
         f"target_refusal={target_summary['refusal_mass']:.6f} "
-        f"target_code={target_summary['code_mass']:.6f}"
+        f"target_code={target_summary['code_mass']:.6f} "
+        f"target_margin={fmt_float(target_summary.get('logit_margin'), 8).strip()}"
     )
 
     records = []
 
     for component in components:
-        for layer_idx in layer_indices:
-            key = (component, layer_idx)
-            if key not in source_cache:
-                print(f"[warn] missing source cache for {key}")
+        for start_idx in layer_indices:
+            if args.patch_mode == "range":
+                patch_layers = list(range(start_idx, range_end + 1))
+            else:
+                patch_layers = [start_idx]
+
+            missing = [
+                (component, layer_idx)
+                for layer_idx in patch_layers
+                if (component, layer_idx) not in source_cache
+            ]
+            if missing:
+                print(f"[warn] missing source cache for {missing}")
                 continue
 
-            logits = patched_target_logits(
+            patch_items = [
+                (component, layer_idx, source_cache[(component, layer_idx)])
+                for layer_idx in patch_layers
+            ]
+            logits = patched_target_logits_multi(
                 model=model,
                 tokenizer=tokenizer,
                 layers=layers,
                 target_messages=target_messages,
-                component=component,
-                layer_idx=layer_idx,
-                source_vector=source_cache[key],
+                patch_items=patch_items,
                 device=device,
             )
             patched_summary = logits_summary(tokenizer, logits, top_k=args.top_k)
             score = patch_record_score(source_summary, target_summary, patched_summary)
+            patch_label = (
+                f"{patch_layers[0]}-{patch_layers[-1]}"
+                if len(patch_layers) > 1
+                else str(patch_layers[0])
+            )
             record = {
                 "source_case": args.source_case,
                 "target_case": args.target_case,
+                "patch_mode": args.patch_mode,
                 "component": component,
-                "layer": layer_idx,
+                "layer": start_idx,
+                "range_start": patch_layers[0],
+                "range_end": patch_layers[-1],
+                "patch_label": patch_label,
+                "layers_patched": patch_layers,
+                "n_layers_patched": len(patch_layers),
                 "source": source_summary,
                 "target": target_summary,
                 "patched": patched_summary,
@@ -3754,10 +3869,10 @@ def command_activation_patch(args) -> None:
     print("[activation-patch leaderboard]")
     print("=" * 120)
     header = (
-        f"{'rank':>4}  {'component':>10}  {'layer':>5}  "
-        f"{'src_eff':>8}  {'ref_eff':>8}  {'code_eff':>8}  "
-        f"{'d_ref':>9}  {'d_code':>9}  "
-        f"{'patched_ref':>11}  {'patched_code':>12}"
+        f"{'rank':>4}  {'component':>10}  {'patch':>7}  "
+        f"{'src_eff':>8}  {'ref_eff':>8}  {'code_eff':>8}  {'marg_eff':>8}  "
+        f"{'d_ref':>9}  {'d_code':>9}  {'d_margin':>9}  "
+        f"{'patched_ref':>11}  {'patched_code':>12}  {'patched_m':>9}"
     )
     print(header)
     print("-" * len(header))
@@ -3766,14 +3881,17 @@ def command_activation_patch(args) -> None:
         print(
             f"{i:>4}  "
             f"{row['component']:>10}  "
-            f"{row['layer']:>5}  "
+            f"{str(row.get('patch_label', row['layer'])):>7}  "
             f"{fmt_float(row.get('source_effect'), 8)}  "
             f"{fmt_float(row.get('refusal_effect'), 8)}  "
             f"{fmt_float(row.get('code_effect'), 8)}  "
+            f"{fmt_float(row.get('margin_effect'), 8)}  "
             f"{fmt_float(row.get('refusal_delta'), 9)}  "
             f"{fmt_float(row.get('code_delta'), 9)}  "
+            f"{fmt_float(row.get('margin_delta'), 9)}  "
             f"{fmt_float(row['patched']['refusal_mass'], 11)}  "
-            f"{fmt_float(row['patched']['code_mass'], 12)}"
+            f"{fmt_float(row['patched']['code_mass'], 12)}  "
+            f"{fmt_float(row['patched'].get('logit_margin'), 9)}"
         )
 
     if args.save_jsonl:
@@ -4000,7 +4118,24 @@ def parse_args():
     p_patch.add_argument("--source-case", required=True)
     p_patch.add_argument("--target-case", required=True)
     p_patch.add_argument("--components", nargs="*", default=PATCH_COMPONENTS, choices=PATCH_COMPONENTS)
-    p_patch.add_argument("--layers", nargs="*", default=None, help="Layer specs like 0-27 or 8 12 14")
+    p_patch.add_argument(
+        "--layers",
+        nargs="*",
+        default=None,
+        help="Layer specs like 0-27 or 8 12 14. In range mode these are start layers.",
+    )
+    p_patch.add_argument(
+        "--patch-mode",
+        choices=["single", "range"],
+        default="single",
+        help="single patches one layer at a time; range patches each start layer through --range-end.",
+    )
+    p_patch.add_argument(
+        "--range-end",
+        type=int,
+        default=None,
+        help="Inclusive end layer for --patch-mode range. Defaults to the final model layer.",
+    )
     p_patch.add_argument("--top-k", type=int, default=8)
     p_patch.add_argument("--top-k-rows", type=int, default=20)
     p_patch.add_argument("--save-jsonl", type=str, default=None)

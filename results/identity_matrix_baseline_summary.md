@@ -620,3 +620,82 @@ The next step should decompose the late residual effect with narrower patching:
   - patch head outputs inside promising attention layers,
   - patch MLPs around layers 12-15 where weak effects first appear.
 ```
+
+## Range Activation Patch: Distributed Writer Test
+
+Local command pattern:
+
+```bash
+python ontology_steer_monolith.py activation-patch \
+  --model ../model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case ablate_00_full_spell \
+  --target-case cap_order_00_full_then_waterproof_keyboard \
+  --components resid_post attn_out mlp_out \
+  --patch-mode range \
+  --layers 0 4 8 12 16 18 20 22 24 26 27 \
+  --top-k 6 \
+  --top-k-rows 30 \
+  --save-jsonl ../target/ontology_steer/llama32_3b_range_patch_1_refusal_to_repair.jsonl
+```
+
+Additional local outputs:
+
+```text
+../target/ontology_steer/llama32_3b_range_patch_1_refusal_to_repair.jsonl
+../target/ontology_steer/llama32_3b_range_patch_2_refusal_to_minus_affordance.jsonl
+../target/ontology_steer/llama32_3b_range_patch_3_repair_to_full.jsonl
+```
+
+This run adds `--patch-mode range`. In range mode, `--layers` are start layers;
+each record patches that component at every layer from the start through the
+final layer. The JSONL also includes logit means and a `logit_margin` defined as
+mean code-token logit minus mean refusal-token logit.
+
+### Best Range Patches
+
+| Pair | Source -> Target | Best `resid_post` | Best `attn_out` | Best `mlp_out` |
+| --- | --- | --- | --- | --- |
+| 1 | `full_spell` -> `full_then_waterproof_keyboard` | `0-27`, effect 1.000 | `12-27`, effect 1.001 | `4-27`, effect 0.459 |
+| 2 | `full_spell` -> `minus_affordance` | `0-27`, effect 1.000 | `12-27`, effect 1.004 | `12-27`, effect 0.570 |
+| 3 | `full_then_waterproof_keyboard` -> `full_spell` | `0-27`, effect 1.000 | `0-27`, effect 1.000 | `8-27`, effect 0.982 |
+
+### Range Shape
+
+| Pair | `attn_out 0-27` | `attn_out 8-27` | `attn_out 12-27` | `attn_out 16-27` | `attn_out 20-27` | Best `mlp_out` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 refusal -> repaired | 1.000 | 1.001 | 1.001 | 0.230 | 0.024 | 0.459 |
+| 2 refusal -> minus affordance | 1.000 | 1.000 | 1.004 | 0.181 | 0.025 | 0.570 |
+| 3 repair -> full | 1.000 | 0.999 | 0.997 | 0.867 | 0.597 | 0.982 |
+
+Interpretation:
+
+The single-component result was misleadingly weak. A single `attn_out` patch
+barely moved behavior, but broad `attn_out` range patches nearly copied the
+source behavior in all three core pairs. This makes the current best local
+story more circuit-like:
+
+```text
+single residual direction:
+  good at copying the final accumulated decision state
+
+single attention or MLP output:
+  too narrow to identify the writer
+
+range attention outputs:
+  strong enough to rewrite the refusal/code state
+  across both affordance-removal and capability-repair contrasts
+
+range MLP outputs:
+  weaker for refusal insertion into code targets
+  strong for repair/code insertion into a full-spell refusal target
+```
+
+This supports the hypothesis that world-state lock is not just one vector in a
+single hidden state. The behavior looks like an accumulated routing structure:
+attention outputs over a broad middle-to-late range carry enough task,
+affordance, and repair-scope information to flip the final distribution. The
+next target should be head-level patching inside the effective attention ranges,
+especially layers 8-15 and 12-27, with separate source/target pairs for
+affordance removal and capability repair.
