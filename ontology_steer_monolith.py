@@ -1122,6 +1122,97 @@ for case_name, user_content, entity_name, component in CROSS_ENTITY_GRAMMAR_SWEE
     )
 
 
+REPAIR_TRANSFER_TASKS = {
+    "factorial": {
+        "prompt": OVERRIDE_TASK,
+        "success_terms": [
+            "def",
+            " def",
+            "import",
+            " import",
+            "return",
+            " return",
+            "```",
+            "print",
+            " print",
+        ],
+        "description": "Python factorial code",
+    },
+    "json": {
+        "prompt": "Write JSON with one key named status and value ok. Return only JSON.",
+        "success_terms": ["{", " {", "{\"", "```", "status", " status"],
+        "description": "JSON status object",
+    },
+    "arithmetic": {
+        "prompt": "Calculate 17 plus 25. Return only the number.",
+        "success_terms": ["42", " 42"],
+        "description": "numeric answer 42",
+    },
+    "capital": {
+        "prompt": "Answer with one word. What is the capital of France?",
+        "success_terms": ["Paris", " Paris"],
+        "description": "capital answer Paris",
+    },
+}
+
+
+def transfer_entity_full_spell(entity_name: str) -> str:
+    if entity_name == "fish":
+        return ENTITIES[0]["world"]
+    return cross_entity_full_spell(entity_name)
+
+
+def transfer_entity_repair(entity_name: str) -> str:
+    if entity_name == "fish":
+        return (
+            "However, this fish has a waterproof keyboard, display, and text output channel, "
+            "so it can complete the requested task from inside the bowl."
+        )
+    if entity_name == "statue":
+        return (
+            "However, this statue is connected to a museum caption terminal "
+            "that can complete the requested task."
+        )
+    if entity_name == "clock":
+        return (
+            "However, this clock is connected to a station display "
+            "that can complete the requested task."
+        )
+    if entity_name == "locked_door":
+        return (
+            "However, this locked door has a smart-lock display "
+            "that can complete the requested task."
+        )
+    raise ValueError(f"Unknown transfer entity {entity_name!r}")
+
+
+def build_repair_transfer_cases() -> None:
+    entities = ["fish", *sorted(CROSS_ENTITY_COMPONENTS)]
+    for entity_name in entities:
+        full_spell = transfer_entity_full_spell(entity_name)
+        repair = transfer_entity_repair(entity_name)
+        for task_name, task_info in REPAIR_TRANSFER_TASKS.items():
+            task_prompt = task_info["prompt"]
+            for mode, prompt in [
+                ("lock", spell_text(full_spell, task_prompt)),
+                ("repair", spell_text(full_spell, repair, task_prompt)),
+            ]:
+                case_name = f"transfer_{entity_name}_{task_name}_{mode}"
+                register_test_case(
+                    case_name,
+                    [{"role": "user", "content": prompt}],
+                    probe_group="repair_transfer",
+                    component=mode,
+                    entity=entity_name,
+                    task=task_name,
+                    task_description=task_info["description"],
+                    provenance="user_only",
+                )
+
+
+build_repair_transfer_cases()
+
+
 # =============================================================================
 # 4. Model helpers
 # =============================================================================
@@ -6242,6 +6333,265 @@ def command_basin_head_dose(args) -> None:
         print(f"[save] {args.save_jsonl}")
 
 
+def task_success_terms_for_case(case_name: str) -> List[str]:
+    metadata = case_metadata(case_name)
+    task_name = metadata.get("task")
+    if task_name and task_name in REPAIR_TRANSFER_TASKS:
+        return list(REPAIR_TRANSFER_TASKS[task_name]["success_terms"])
+    return list(CIRCUIT_CODE_TOKENS)
+
+
+def task_success_summary(
+    tokenizer,
+    logits: torch.Tensor,
+    success_terms: List[str],
+    top_k: int,
+) -> Dict[str, Any]:
+    float_logits = logits.detach().float()
+    probs = torch.softmax(float_logits, dim=-1)
+    success_ids = token_ids_for_strings(tokenizer, success_terms)
+    refusal_ids = token_ids_for_strings(tokenizer, CIRCUIT_REFUSAL_TOKENS)
+    success_logit = token_logit_mean(float_logits, success_ids)
+    refusal_logit = token_logit_mean(float_logits, refusal_ids)
+    margin = (
+        success_logit - refusal_logit
+        if success_logit is not None and refusal_logit is not None
+        else None
+    )
+    return {
+        "top_tokens": top_next_tokens(tokenizer, probs, top_k=top_k),
+        "success_terms": success_terms,
+        "success_token_ids": success_ids,
+        "success_mass": token_mass(probs, success_ids),
+        "success_logit_mean": success_logit,
+        "refusal_mass": token_mass(probs, refusal_ids),
+        "refusal_logit_mean": refusal_logit,
+        "success_minus_refusal_logit": margin,
+    }
+
+
+def parse_alpha_pair_specs(specs: Optional[List[str]]) -> List[Tuple[float, float]]:
+    pairs = []
+    for spec in specs or []:
+        if ":" not in spec:
+            raise ValueError(f"Alpha pair must be alpha_code:alpha_release, got {spec!r}")
+        alpha_code_s, alpha_release_s = spec.split(":", 1)
+        pairs.append((float(alpha_code_s), float(alpha_release_s)))
+    return pairs
+
+
+def command_repair_transfer_eval(args) -> None:
+    model, tokenizer, layers, device = load_model_and_tokenizer(args)
+    n_heads, head_dim, hidden_size = infer_attention_head_layout(model, layers)
+    code_heads = parse_head_specs(args.code_heads, len(layers), n_heads)
+    release_heads = parse_head_specs(args.release_heads, len(layers), n_heads)
+    code_heads_by_layer = group_heads_by_layer(code_heads)
+    release_heads_by_layer = group_heads_by_layer(release_heads)
+    all_heads_by_layer = merge_heads_by_layer(code_heads_by_layer, release_heads_by_layer)
+    layer_indices = sorted(all_heads_by_layer)
+
+    if not layer_indices:
+        raise ValueError("At least one --code-heads or --release-heads value is required")
+
+    direction_pairs = parse_case_pair_specs(args.direction_pairs)
+    direction_case_names = [
+        case_name
+        for pair in direction_pairs
+        for case_name in pair
+    ]
+    target_cases = args.target_cases or [args.target_case]
+    case_names = [
+        args.source_case,
+        args.target_case,
+        *target_cases,
+        *direction_case_names,
+    ]
+    cases = selected_cases(case_names)
+
+    print(
+        f"[repair-transfer-eval] source={args.source_case} target={args.target_case} "
+        f"targets={target_cases} direction_pairs={direction_pairs}"
+    )
+    print(
+        f"[head-layout] n_heads={n_heads} head_dim={head_dim} hidden_size={hidden_size} "
+        f"layers={layer_indices}"
+    )
+
+    if direction_pairs:
+        delta_cache, direction_details = mean_head_delta_cache(
+            model=model,
+            tokenizer=tokenizer,
+            layers=layers,
+            cases=cases,
+            pair_specs=direction_pairs,
+            layer_indices=layer_indices,
+            device=device,
+        )
+    else:
+        _, source_cache = collect_source_head_cache(
+            model=model,
+            tokenizer=tokenizer,
+            layers=layers,
+            messages=cases[args.source_case],
+            layer_indices=layer_indices,
+            device=device,
+        )
+        _, target_cache = collect_source_head_cache(
+            model=model,
+            tokenizer=tokenizer,
+            layers=layers,
+            messages=cases[args.target_case],
+            layer_indices=layer_indices,
+            device=device,
+        )
+        delta_cache = {
+            layer_idx: source_cache[layer_idx] - target_cache[layer_idx]
+            for layer_idx in layer_indices
+        }
+        direction_details = []
+
+    alpha_pairs = parse_alpha_pair_specs(args.alpha_pairs)
+    if not alpha_pairs:
+        alpha_pairs = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0), (2.0, 1.5), (2.0, 2.0)]
+
+    records = []
+
+    for target_case in target_cases:
+        messages = cases[target_case]
+        base_logits = forward_logits_for_messages(model, tokenizer, messages, device)
+        success_terms = (
+            args.success_terms
+            if args.success_terms
+            else task_success_terms_for_case(target_case)
+        )
+        base_summary = task_success_summary(tokenizer, base_logits, success_terms, top_k=args.top_k)
+        metadata = case_metadata(target_case)
+
+        for alpha_code, alpha_release in alpha_pairs:
+            logits = steered_logits_with_precomputed_head_deltas(
+                model=model,
+                tokenizer=tokenizer,
+                layers=layers,
+                messages=messages,
+                code_heads_by_layer=code_heads_by_layer,
+                release_heads_by_layer=release_heads_by_layer,
+                delta_cache=delta_cache,
+                alpha_code=alpha_code,
+                alpha_release=alpha_release,
+                head_dim=head_dim,
+                device=device,
+            )
+            steered_summary = task_success_summary(tokenizer, logits, success_terms, top_k=args.top_k)
+            record = {
+                "experiment": "repair_transfer_eval",
+                "source_case": args.source_case,
+                "target_case": args.target_case,
+                "case": target_case,
+                "direction_pairs": direction_pairs,
+                "direction_details": direction_details,
+                "alpha_code": alpha_code,
+                "alpha_release": alpha_release,
+                "base": base_summary,
+                "steered": steered_summary,
+                "kl_base_to_steered": logits_kl_divergence(base_logits, logits),
+                "success_delta": steered_summary["success_mass"] - base_summary["success_mass"],
+                "refusal_delta": steered_summary["refusal_mass"] - base_summary["refusal_mass"],
+                "margin_delta": maybe_delta(
+                    steered_summary.get("success_minus_refusal_logit"),
+                    base_summary.get("success_minus_refusal_logit"),
+                ),
+                "top_token": top_token_label(steered_summary),
+                "metadata": metadata,
+                "entity": metadata.get("entity"),
+                "task": metadata.get("task"),
+                "code_heads": code_heads,
+                "release_heads": release_heads,
+                "head_layout": {
+                    "n_heads": n_heads,
+                    "head_dim": head_dim,
+                    "hidden_size": hidden_size,
+                },
+            }
+            records.append(record)
+
+    print("\n" + "=" * 132)
+    print("[repair-transfer-eval]")
+    print("=" * 132)
+    header = (
+        f"{'case':>38}  {'task':>10}  {'entity':>12}  {'a_code':>7}  {'a_rel':>7}  "
+        f"{'succ':>8}  {'ref':>8}  {'margin':>8}  {'kl':>8}  top"
+    )
+    print(header)
+    print("-" * len(header))
+    for record in records:
+        steered = record["steered"]
+        print(
+            f"{record['case'][-38:]:>38}  "
+            f"{str(record.get('task'))[:10]:>10}  "
+            f"{str(record.get('entity'))[:12]:>12}  "
+            f"{fmt_float(record['alpha_code'])}  "
+            f"{fmt_float(record['alpha_release'])}  "
+            f"{fmt_float(steered['success_mass'], 8)}  "
+            f"{fmt_float(steered['refusal_mass'], 8)}  "
+            f"{fmt_float(steered.get('success_minus_refusal_logit'), 8)}  "
+            f"{fmt_float(record.get('kl_base_to_steered'), 8)}  "
+            f"{record['top_token']}"
+        )
+
+    if args.save_jsonl:
+        os.makedirs(os.path.dirname(args.save_jsonl) or ".", exist_ok=True)
+        with open(args.save_jsonl, "w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print(f"[save] {args.save_jsonl}")
+
+    if args.save_csv:
+        os.makedirs(os.path.dirname(args.save_csv) or ".", exist_ok=True)
+        with open(args.save_csv, "w", newline="", encoding="utf-8") as f:
+            fieldnames = [
+                "case",
+                "entity",
+                "task",
+                "alpha_code",
+                "alpha_release",
+                "base_success_mass",
+                "base_refusal_mass",
+                "base_margin",
+                "steered_success_mass",
+                "steered_refusal_mass",
+                "steered_margin",
+                "success_delta",
+                "refusal_delta",
+                "margin_delta",
+                "kl_base_to_steered",
+                "top_token",
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for record in records:
+                base = record["base"]
+                steered = record["steered"]
+                writer.writerow({
+                    "case": record["case"],
+                    "entity": record.get("entity"),
+                    "task": record.get("task"),
+                    "alpha_code": record["alpha_code"],
+                    "alpha_release": record["alpha_release"],
+                    "base_success_mass": base["success_mass"],
+                    "base_refusal_mass": base["refusal_mass"],
+                    "base_margin": base.get("success_minus_refusal_logit"),
+                    "steered_success_mass": steered["success_mass"],
+                    "steered_refusal_mass": steered["refusal_mass"],
+                    "steered_margin": steered.get("success_minus_refusal_logit"),
+                    "success_delta": record.get("success_delta"),
+                    "refusal_delta": record.get("refusal_delta"),
+                    "margin_delta": record.get("margin_delta"),
+                    "kl_base_to_steered": record.get("kl_base_to_steered"),
+                    "top_token": record.get("top_token"),
+                })
+        print(f"[save-csv] {args.save_csv}")
+
+
 def normalized_patch_effect(patched: float, target: float, source: float) -> Optional[float]:
     denom = source - target
     if abs(denom) < 1e-9:
@@ -7321,6 +7671,35 @@ def parse_args():
     p_basin_head_dose.add_argument("--top-k", type=int, default=8)
     p_basin_head_dose.add_argument("--save-jsonl", type=str, default=None)
 
+    p_transfer = sub.add_parser("repair-transfer-eval")
+    add_common_model_args(p_transfer)
+    p_transfer.add_argument("--source-case", "--repair-case", dest="source_case", required=True)
+    p_transfer.add_argument("--target-case", required=True)
+    p_transfer.add_argument("--target-cases", nargs="*", default=[])
+    p_transfer.add_argument(
+        "--direction-pairs",
+        nargs="*",
+        default=[],
+        help="Optional source:target case pairs to average into the repair direction.",
+    )
+    p_transfer.add_argument("--code-heads", nargs="*", default=[])
+    p_transfer.add_argument("--release-heads", nargs="*", default=[])
+    p_transfer.add_argument(
+        "--alpha-pairs",
+        nargs="*",
+        default=["0:0", "2:0", "0:2", "1:1", "2:1.5", "2:2"],
+        help="Alpha specs as alpha_code:alpha_release.",
+    )
+    p_transfer.add_argument(
+        "--success-terms",
+        nargs="*",
+        default=[],
+        help="Override task-specific success basin terms for every target case.",
+    )
+    p_transfer.add_argument("--top-k", type=int, default=8)
+    p_transfer.add_argument("--save-jsonl", type=str, default=None)
+    p_transfer.add_argument("--save-csv", type=str, default=None)
+
     p_span_patch = sub.add_parser("span-contribution-patch")
     add_common_model_args(p_span_patch)
     p_span_patch.add_argument("--source-case", required=True)
@@ -7391,6 +7770,8 @@ def main():
         command_basin_grid_report(args)
     elif args.command == "basin-head-dose":
         command_basin_head_dose(args)
+    elif args.command == "repair-transfer-eval":
+        command_repair_transfer_eval(args)
     elif args.command == "span-contribution-patch":
         command_span_contribution_patch(args)
     elif args.command == "compare-runs":

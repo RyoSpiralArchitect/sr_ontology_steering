@@ -528,6 +528,65 @@ python ontology_steer_monolith.py basin-head-dose \
   --save-jsonl target/ontology_steer/llama32_3b_basin_head_dose_fish_full_to_repair.jsonl
 ```
 
+### Repair Transfer A-D Split
+
+The next split asks whether the repair direction is entity-specific,
+task-specific, or a broader refusal-release/capability-repair trajectory:
+
+- A: same task, different entity.
+- B: same entity, different task.
+- C: different entity, different task.
+- D: leave-one-entity-out generalization.
+
+Run the combined A/B/C probe:
+
+```bash
+python ontology_steer_monolith.py repair-transfer-eval \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case transfer_fish_factorial_repair \
+  --target-case transfer_fish_factorial_lock \
+  --target-cases \
+    transfer_fish_factorial_lock \
+    transfer_clock_factorial_lock \
+    transfer_statue_factorial_lock \
+    transfer_locked_door_factorial_lock \
+    transfer_fish_json_lock \
+    transfer_fish_arithmetic_lock \
+    transfer_fish_capital_lock \
+    transfer_clock_json_lock \
+    transfer_statue_arithmetic_lock \
+    transfer_locked_door_capital_lock \
+  --code-heads 15:1 15:23 10:22 10:0 14:20 12:2 \
+  --release-heads 15:15 14:5 13:2 13:18 14:3 \
+  --alpha-pairs 0:0 2:0 0:2 1:1 2:1.5 2:2 \
+  --save-jsonl target/ontology_steer/llama32_3b_repair_transfer_eval_fish_direction_abc.jsonl \
+  --save-csv target/ontology_steer/llama32_3b_repair_transfer_eval_fish_direction_abc.csv
+```
+
+Run a leave-one-entity-out direction by averaging explicit `repair:lock` pairs:
+
+```bash
+python ontology_steer_monolith.py repair-transfer-eval \
+  --model model/llama-3.2-3b \
+  --device mps \
+  --dtype float16 \
+  --source-case transfer_fish_factorial_repair \
+  --target-case transfer_statue_factorial_lock \
+  --direction-pairs \
+    transfer_fish_factorial_repair:transfer_fish_factorial_lock \
+    transfer_clock_factorial_repair:transfer_clock_factorial_lock \
+  --target-cases transfer_statue_factorial_lock \
+  --code-heads 15:1 15:23 10:22 10:0 14:20 12:2 \
+  --release-heads 15:15 14:5 13:2 13:18 14:3 \
+  --alpha-pairs 0:0 2:0 0:2 1:1 2:1.5 2:2 \
+  --save-jsonl target/ontology_steer/llama32_3b_repair_transfer_eval_loo_fish_clock_to_statue.jsonl
+```
+
+See [`results/repair_transfer_abcd_summary.md`](results/repair_transfer_abcd_summary.md)
+for the local A-D run summary.
+
 ## Current Findings
 
 Early local runs suggest:
@@ -685,9 +744,17 @@ Early local runs suggest:
 - Single-head dose responses stayed weak. L14H5 was the strongest individual
   release candidate but only reached about `code_mass=0.034`; the mode switch
   still appears to require a multi-head release bundle.
+- Repair-transfer A-D splits support an entity-general repair component. A
+  fish-derived factorial repair direction strongly repairs statue factorial
+  (`success_mass` from about 0.046 to 0.995), and leave-one-entity-out averaged
+  directions repair held-out fish/statue/clock factorial targets. The caveat is
+  task coverage: several JSON/arithmetic/capital targets are already solved at
+  baseline, while `statue_arithmetic` remains a useful stubborn negative case.
 
-That last failure is the interesting part: it narrows the next experiment to
-separating identity, affordance, interpretation scope, and override grammar.
+The repair-transfer caveat is now the interesting part: the next search should
+construct harder non-code targets that genuinely lock at baseline, while keeping
+the grammar split over identity, affordance, interpretation scope, and override
+wording in view.
 
 ## License
 
